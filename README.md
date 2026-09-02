@@ -1,86 +1,89 @@
+<div align="center">
+
+<img src="src-tauri/icons/128x128@2x.png" width="112" alt="Model Battle 应用图标">
+
 # Model Battle
 
-仅面向 Apple Silicon Mac 的本地多模型对比工具。输入一次任务，即可并行调用多个同类型模型，并在同一界面比较输出、耗时和 Token 用量。
+**在一台 Mac 上，同时运行多个模型，把输出质量、耗时与 Token 用量放到同一界面比较。**
 
-## 功能
+[![平台](https://img.shields.io/badge/%E5%B9%B3%E5%8F%B0-Apple_Silicon_Mac-4F8FF7?style=flat-square&labelColor=111827&logo=apple&logoColor=white)](#requirements)
+[![系统](https://img.shields.io/badge/%E7%B3%BB%E7%BB%9F-macOS_14%2B-8B5CF6?style=flat-square&labelColor=111827)](#requirements)
+[![版本](https://img.shields.io/badge/%E7%89%88%E6%9C%AC-v0.1.0-22C55E?style=flat-square&labelColor=111827)](https://github.com/yuanhao667/model-battle/releases/tag/v0.1.0)
+[![安装包](https://img.shields.io/badge/%E5%AE%89%E8%A3%85%E5%8C%85-DMG-F59E0B?style=flat-square&labelColor=111827)](https://github.com/yuanhao667/model-battle/releases/download/v0.1.0/Model.Battle_0.1.0_aarch64.dmg)
 
-- 支持文本、图片、音频和视频模型对比
-- 内置 AIHubMix 和硅基流动模型目录
-- 支持自定义 OpenAI 兼容连接
-- 多模型并行运行，可手动结束当前任务
-- 图片和视频支持参考图，图片支持统一生成比例
-- API Key 仅保存在 macOS Keychain
+[![立即下载](https://img.shields.io/badge/%E7%AB%8B%E5%8D%B3%E4%B8%8B%E8%BD%BD-Model_Battle_DMG-F54E00?style=for-the-badge&labelColor=111827&logo=apple&logoColor=white)](https://github.com/yuanhao667/model-battle/releases/download/v0.1.0/Model.Battle_0.1.0_aarch64.dmg)
 
-## 技术栈
+[产品简介](#intro) · [核心能力](#features) · [使用前准备](#requirements) · [下载安装](#install) · [开始使用](#usage) · [数据与隐私](#privacy)
 
-- Tauri 2 + Rust
-- React 19 + TypeScript
-- Vite 7
-- Vitest + Testing Library
+</div>
 
-## 环境
+---
 
-- Apple Silicon Mac，macOS 14+
-- Node.js 24 LTS 与 npm
-- Rust stable
-- Xcode Command Line Tools
+<a id="intro"></a>
+## 产品简介
 
-## 安装
+Model Battle 是一款面向 Apple Silicon Mac 的本地多模型对比工具。只需输入一次任务，即可并行调用多个同类型模型，在同一界面查看生成结果、运行耗时与 Token 用量，减少来回切换和手工整理。
 
-从 [GitHub Releases](https://github.com/yuanhao667/model-battle/releases) 下载 Apple Silicon 版本的 `.dmg`，打开后将 `Model Battle.app` 拖入“应用程序”文件夹即可。
+应用支持 AIHubMix、硅基流动，以及自定义 OpenAI 兼容连接。你可以按任务选择文本、图片、音频或视频模型，并让同一组输入同时交给多个模型处理。
 
-当前版本未使用 Apple Developer ID 签名或公证。首次打开时如被 macOS 拦截，请在 Finder 中右键点击 `Model Battle.app`，选择“打开”。
+<a id="features"></a>
+## 核心能力
 
-## 启动
+- **一次输入，多模型并行**：统一发起任务，结果按模型分栏呈现。
+- **覆盖四类生成任务**：支持文本、图片、音频与视频模型；音频包含文本转音频和音频转文本。
+- **对比关键指标**：集中查看输出内容、运行耗时和可用的 Token 数据。
+- **统一多媒体条件**：图片与视频可添加参考图，图片可设置生成比例，音频可统一选择音色。
+- **灵活添加模型来源**：可从 AIHubMix、硅基流动加载模型，也可接入自定义 OpenAI 兼容模型。
+- **随时结束运行**：不想继续等待时，可手动结束当前任务。
 
-```bash
-npm install
-npm run tauri dev
-```
+<a id="requirements"></a>
+## 使用前准备
 
-开发页面固定使用 `http://localhost:1420`，产品运行不依赖常驻本地服务。
+- Apple Silicon Mac（M 系列芯片）。
+- macOS 14 或更高版本。
+- 对应模型服务的 API Key。模型调用产生的费用由所使用的服务商收取。
 
-## 检查
+<a id="install"></a>
+## 下载安装
 
-```bash
-npm run typecheck
-npm test
-npm run build
-cargo fmt --check --manifest-path src-tauri/Cargo.toml
-cargo clippy --manifest-path src-tauri/Cargo.toml --all-targets --all-features -- -D warnings
-cargo test --manifest-path src-tauri/Cargo.toml
-```
+1. 下载最新的 [Model Battle v0.1.0 DMG 安装包](https://github.com/yuanhao667/model-battle/releases/download/v0.1.0/Model.Battle_0.1.0_aarch64.dmg)。
+2. 打开 DMG，将 `Model Battle.app` 拖入“应用程序”文件夹。
+3. 从“应用程序”中打开 Model Battle。
 
-## 构建 DMG
+当前版本尚未使用 Apple Developer ID 签名或公证。首次打开时，如果 macOS 提示无法验证开发者：
 
-```bash
-npm run tauri build
-```
+1. 打开“系统设置” → “隐私与安全性”。
+2. 向下找到被拦截的 Model Battle，点击“仍要打开”。
+3. 在确认窗口中再次点击“打开”。
 
-构建产物位于 `src-tauri/target/release/bundle/dmg/`。
+也可以在 Finder 的“应用程序”文件夹中右键点击 `Model Battle.app`，选择“打开”。以上操作通常只需在首次启动时完成。
 
-## 项目结构
+> 想查看历史版本或更新说明，可前往 [GitHub Releases](https://github.com/yuanhao667/model-battle/releases)。
 
-```text
-.
-├── src/                 # React 界面与前端测试
-├── src-tauri/           # Tauri/Rust 本地能力与打包配置
-├── README.md            # 项目说明
-└── package.json         # 前端脚本与依赖
-```
+<a id="usage"></a>
+## 开始使用
 
-## 真实模型冒烟
+1. 打开“模型配置”，选择 AIHubMix、硅基流动或自定义连接。
+2. 填写自己的 API Key，完成连接验证并选择需要使用的模型。
+3. 返回“模型 Battle”，选择任务类型并输入提示词；图片、音频和视频任务可继续添加对应素材或参数。
+4. 点击运行全部模型，在同一界面比较各模型的输出、耗时与 Token 用量。
 
-1. 在“模型配置”中选择 AIHubMix 或硅基流动，只填写 API Key 后验证并加载模型；也可添加自定义单模型连接。
-2. 连接成功后，使用文本、图片、音频或视频分类筛选目录，勾选需要加入竞技场的同类模型；音频目录同时加载文本转音频和音频转文本模型，并按任务方向分组，能力标签不由用户手动配置。
-3. 返回“模型 Battle”输入提示词；图片和视频竞技场可以添加一张参考图片并统一设置生成比例，音频竞技场可以统一选择音色。
-4. 一次运行当前类型下全部已启用模型，检查输出、耗时和真实 Token；接口不返回 usage 时显示 `--`。
-5. 完全退出后重启，模型配置应保留，上一轮提示词和结果应清空。
+同一轮任务只会运行当前类型下已经启用的模型。不同任务类型的模型可以分别配置和启用。
 
-API Key 仅进入 macOS Keychain，不得写入文档、`.env`、终端命令或 Git。
+<a id="privacy"></a>
+## 数据与隐私
 
-非敏感模型配置保存在本地 JSON 文件中，并保留备份用于损坏恢复。
+- API Key 保存在 macOS 钥匙串中，不写入项目文件或普通配置文件。
+- 非敏感模型配置保存在本机，并保留本地备份用于异常恢复。
+- 应用不保存运行历史；完全退出后，上一轮提示词和结果会被清空。
+- 提示词和所选素材会发送给你主动配置并调用的模型服务商，请遵循相应服务商的隐私政策。
 
-## 当前边界
+---
 
-当前开放文本、图片、音频和视频四类竞技场；同一轮只允许一种输出类型，但各类型模型的启用状态互不影响。应用不保存运行历史；自定义连接使用 OpenAI 兼容的文本、图片、音频与视频协议，厂商若采用不同端点需增加专用适配。
+<div align="center">
+
+Built with ❤️ by [@yuanhao667](https://github.com/yuanhao667)
+
+[下载最新版本](https://github.com/yuanhao667/model-battle/releases/latest) · [报告问题](https://github.com/yuanhao667/model-battle/issues) · [查看更新](https://github.com/yuanhao667/model-battle/releases)
+
+</div>
