@@ -1,6 +1,5 @@
 use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64};
 use futures_util::future::join_all;
-use keyring::Entry;
 use reqwest::{Client, StatusCode, Url};
 use serde::{Deserialize, Serialize};
 use std::{
@@ -17,8 +16,7 @@ use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
 const SCHEMA_VERSION: u32 = 1;
-const KEYCHAIN_SERVICE: &str = "Model Battle API Key 加密存储";
-const KEYCHAIN_VAULT_ACCOUNT: &str = "api-key-vault-v1";
+const CREDENTIALS_FILE_NAME: &str = "credentials.json";
 const CONNECTION_TEST_PROMPT: &str = "请只回复：连接成功";
 
 #[derive(Debug, Clone, Serialize)]
@@ -240,7 +238,8 @@ struct CurrentRun {
 #[derive(Clone)]
 struct AppState {
     config_path: PathBuf,
-    key_vault: Arc<Mutex<Option<HashMap<String, String>>>>,
+    credentials_path: PathBuf,
+    credential_cache: Arc<Mutex<Option<HashMap<String, String>>>>,
     validated_connections: Arc<Mutex<HashMap<String, u64>>>,
     current_run: Arc<Mutex<Option<CurrentRun>>>,
 }
@@ -274,11 +273,11 @@ fn validate_output_type(output_type: &str) -> AppResult<()> {
     }
 }
 
-fn output_category(output_type: &str) -> &str {
-    if output_type == "audio_to_text" {
-        "audio"
+fn validate_catalog_filter(output_type: &str) -> AppResult<()> {
+    if output_type == "all" {
+        Ok(())
     } else {
-        output_type
+        validate_output_type(output_type)
     }
 }
 
@@ -395,6 +394,178 @@ fn audio_endpoint(mut base: Url) -> Url {
     let path = format!("{}/audio/speech", base.path().trim_end_matches('/'));
     base.set_path(&path);
     base
+}
+
+fn uses_chat_audio_endpoint(provider_kind: &str, model_id: &str) -> bool {
+    provider_kind == "aihubmix"
+        && model_id
+            .to_ascii_lowercase()
+            .contains("gpt-4o-audio-preview")
+}
+
+fn speech_request_body(
+    provider_kind: &str,
+    model_id: &str,
+    prompt: &str,
+    voice: &str,
+    response_format: &str,
+) -> serde_json::Value {
+    let model_lower = model_id.to_ascii_lowercase();
+    let (input, voice) = if provider_kind == "siliconflow" {
+        let voice = match voice {
+            "echo" => "alex",
+            "fable" => "claire",
+            "onyx" => "benjamin",
+            "nova" => "diana",
+            "shimmer" => "bella",
+            _ => "anna",
+        };
+        let input = if model_id.to_ascii_lowercase().contains("moss-ttsd")
+            && !prompt.trim_start().starts_with("[S1]")
+        {
+            format!("[S1]{prompt}")
+        } else {
+            prompt.to_string()
+        };
+        (input, format!("{model_id}:{voice}"))
+    } else if provider_kind == "aihubmix" && model_lower.contains("qwen-audio-3.0-tts") {
+        let voice = if model_lower.contains("plus") {
+            match voice {
+                "echo" | "onyx" => "longanlufeng",
+                _ => "longanlingxin",
+            }
+        } else {
+            match voice {
+                "echo" => "loongjohn",
+                "fable" => "longanyuanfei",
+                "onyx" => "longchuanshu_v3.6",
+                "nova" => "longanxiaoxin",
+                "shimmer" => "longanlingxi",
+                _ => "longanfengyue",
+            }
+        };
+        (prompt.to_string(), voice.to_string())
+    } else {
+        (prompt.to_string(), voice.to_string())
+    };
+    serde_json::json!({
+        "model": model_id,
+        "input": input,
+        "voice": voice,
+        "response_format": response_format
+    })
+}
+
+fn chat_audio_request_body(model_id: &str, prompt: &str, voice: &str) -> serde_json::Value {
+    serde_json::json!({
+        "model": model_id,
+        "modalities": ["text", "audio"],
+        "audio": {"voice": voice, "format": "wav"},
+        "messages": [{"role": "user", "content": prompt}],
+        "stream": false
+    })
+}
+
+fn parse_chat_audio_response(body: serde_json::Value) -> AppResult<GeneratedMedia> {
+    let encoded = body
+        .pointer("/choices/0/message/audio/data")
+        .and_then(serde_json::Value::as_str)
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| AppError::new("RESPONSE_INVALID", "模型没有返回可播放的音频。", false))?;
+    let bytes = BASE64
+        .decode(encoded)
+        .map_err(|_| AppError::new("RESPONSE_INVALID", "模型返回了无效的音频数据。", false))?;
+    if bytes.len() > 25 * 1024 * 1024 {
+        return Err(AppError::new(
+            "RESPONSE_INVALID",
+            "生成结果过大，当前版本无法在卡片内加载。",
+            false,
+        ));
+    }
+    Ok(GeneratedMedia {
+        data_url: format!("data:audio/wav;base64,{encoded}"),
+    })
+}
+
+fn qwen_audio_result_url(body: &serde_json::Value) -> Option<&str> {
+    let known = [
+        "/url",
+        "/audio_url",
+        "/audio/url",
+        "/data/0/url",
+        "/output/url",
+        "/output/audio/url",
+        "/output/audio",
+    ]
+    .into_iter()
+    .find_map(|pointer| body.pointer(pointer).and_then(serde_json::Value::as_str))
+    .filter(|value| value.starts_with("https://"));
+    if known.is_some() {
+        return known;
+    }
+    match body {
+        serde_json::Value::Object(values) => values.values().find_map(qwen_audio_result_url),
+        serde_json::Value::Array(values) => values.iter().find_map(qwen_audio_result_url),
+        serde_json::Value::String(value) if value.starts_with("https://") => Some(value),
+        _ => None,
+    }
+}
+
+fn audio_file_name(mime: &str) -> AppResult<&'static str> {
+    match mime.to_ascii_lowercase().as_str() {
+        "audio/mpeg" | "audio/mp3" => Ok("audio.mp3"),
+        "audio/mp4" | "audio/x-m4a" | "video/mp4" => Ok("audio.m4a"),
+        "audio/wav" | "audio/x-wav" | "audio/wave" => Ok("audio.wav"),
+        "audio/webm" | "video/webm" => Ok("audio.webm"),
+        _ => Err(AppError::new(
+            "VALIDATION_ERROR",
+            "仅支持 mp3、mp4、mpeg、mpga、m4a、wav 或 webm 音频。",
+            false,
+        )),
+    }
+}
+
+fn validate_audio_payload(mime: &str, bytes: &[u8]) -> AppResult<()> {
+    if !matches!(
+        mime.to_ascii_lowercase().as_str(),
+        "audio/wav" | "audio/x-wav" | "audio/wave"
+    ) {
+        return Ok(());
+    }
+    if bytes.len() < 12 || &bytes[..4] != b"RIFF" || &bytes[8..12] != b"WAVE" {
+        return Err(AppError::new(
+            "VALIDATION_ERROR",
+            "这个 WAV 文件无法识别，请重新导出或更换音频。",
+            false,
+        ));
+    }
+    let mut offset = 12usize;
+    while offset.checked_add(8).is_some_and(|end| end <= bytes.len()) {
+        let chunk_size = u32::from_le_bytes(
+            bytes[offset + 4..offset + 8]
+                .try_into()
+                .expect("WAV chunk size is four bytes"),
+        ) as usize;
+        let data_start = offset + 8;
+        let Some(data_end) = data_start.checked_add(chunk_size) else {
+            break;
+        };
+        if data_end > bytes.len() {
+            break;
+        }
+        if &bytes[offset..offset + 4] == b"data" && chunk_size > 0 {
+            return Ok(());
+        }
+        let Some(next) = data_end.checked_add(chunk_size % 2) else {
+            break;
+        };
+        offset = next;
+    }
+    Err(AppError::new(
+        "VALIDATION_ERROR",
+        "这个 WAV 文件不含有效音轨，请重新导出或更换音频。",
+        false,
+    ))
 }
 
 fn transcription_endpoint(mut base: Url) -> Url {
@@ -540,55 +711,67 @@ fn save_config(path: &Path, config: &AppConfig) -> AppResult<()> {
     Ok(())
 }
 
-fn keychain_entry_for(service: &str, account: &str) -> AppResult<Entry> {
-    Entry::new(service, account)
-        .map_err(|_| AppError::new("UNKNOWN", "无法访问 macOS 钥匙串。", true))
-}
-
-fn keychain_entry(account: &str) -> AppResult<Entry> {
-    keychain_entry_for(KEYCHAIN_SERVICE, account)
-}
-
-fn read_key_vault() -> AppResult<Option<HashMap<String, String>>> {
-    match keychain_entry(KEYCHAIN_VAULT_ACCOUNT)?.get_password() {
-        Ok(value) => serde_json::from_str(&value)
-            .map(Some)
-            .map_err(|_| AppError::new("UNKNOWN", "钥匙串中的 API Key 仓库无法读取。", false)),
-        Err(keyring::Error::NoEntry) => Ok(None),
-        Err(_) => Err(AppError::new(
-            "KEYCHAIN_PERMISSION_REQUIRED",
-            "需要允许访问 macOS 钥匙串。",
-            true,
-        )),
+fn read_credentials(path: &Path) -> AppResult<HashMap<String, String>> {
+    if !path.exists() {
+        return Ok(HashMap::new());
     }
+    let bytes = fs::read(path)
+        .map_err(|_| AppError::new("UNKNOWN", "无法读取本机 API Key 文件。", true))?;
+    serde_json::from_slice(&bytes)
+        .map_err(|_| AppError::new("UNKNOWN", "本机 API Key 文件无法解析。", false))
 }
 
-fn write_key_vault(keys: &HashMap<String, String>) -> AppResult<()> {
-    let value = serde_json::to_string(keys)
-        .map_err(|_| AppError::new("UNKNOWN", "无法保存 API Key 仓库。", false))?;
-    keychain_entry(KEYCHAIN_VAULT_ACCOUNT)?
-        .set_password(&value)
-        .map_err(|_| AppError::new("UNKNOWN", "API Key 无法写入 macOS 钥匙串。", true))
+fn write_credentials(path: &Path, keys: &HashMap<String, String>) -> AppResult<()> {
+    let parent = path
+        .parent()
+        .ok_or_else(|| AppError::new("UNKNOWN", "无法确定本地配置目录。", false))?;
+    fs::create_dir_all(parent)
+        .map_err(|_| AppError::new("UNKNOWN", "无法创建本地配置目录。", true))?;
+    let bytes = serde_json::to_vec(keys)
+        .map_err(|_| AppError::new("UNKNOWN", "无法生成本机 API Key 文件。", false))?;
+    let temp = path.with_file_name("credentials.tmp.json");
+    let mut options = OpenOptions::new();
+    options.create(true).truncate(true).write(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    let mut file = options
+        .open(&temp)
+        .map_err(|_| AppError::new("UNKNOWN", "无法写入本机 API Key 文件。", true))?;
+    file.write_all(&bytes)
+        .and_then(|_| file.sync_all())
+        .map_err(|_| AppError::new("UNKNOWN", "无法完整保存本机 API Key。", true))?;
+    fs::rename(&temp, path)
+        .map_err(|_| AppError::new("UNKNOWN", "无法替换本机 API Key 文件。", true))?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(path, fs::Permissions::from_mode(0o600))
+            .map_err(|_| AppError::new("UNKNOWN", "无法限制 API Key 文件权限。", true))?;
+    }
+    Ok(())
 }
 
-fn cached_key_vault(state: &AppState) -> AppResult<HashMap<String, String>> {
-    let mut cache = state.key_vault.lock().map_err(|_| lock_error())?;
+fn cached_credentials(state: &AppState) -> AppResult<HashMap<String, String>> {
+    let mut cache = state.credential_cache.lock().map_err(|_| lock_error())?;
     if let Some(keys) = cache.as_ref() {
         return Ok(keys.clone());
     }
-    let keys = read_key_vault()?.unwrap_or_default();
+    let keys = read_credentials(&state.credentials_path)?;
     *cache = Some(keys.clone());
     Ok(keys)
 }
 
-fn save_key_vault(state: &AppState, keys: &HashMap<String, String>) -> AppResult<()> {
-    write_key_vault(keys)?;
-    *state.key_vault.lock().map_err(|_| lock_error())? = Some(keys.clone());
+fn save_credentials(state: &AppState, keys: &HashMap<String, String>) -> AppResult<()> {
+    write_credentials(&state.credentials_path, keys)?;
+    *state.credential_cache.lock().map_err(|_| lock_error())? = Some(keys.clone());
     Ok(())
 }
 
 fn get_key(state: &AppState, connection_id: &str) -> AppResult<String> {
-    cached_key_vault(state)?
+    cached_credentials(state)?
         .get(connection_id)
         .cloned()
         .ok_or_else(|| {
@@ -601,15 +784,15 @@ fn get_key(state: &AppState, connection_id: &str) -> AppResult<String> {
 }
 
 fn set_key(state: &AppState, connection_id: &str, key: &str) -> AppResult<()> {
-    let mut keys = cached_key_vault(state)?;
+    let mut keys = cached_credentials(state)?;
     keys.insert(connection_id.to_string(), key.to_string());
-    save_key_vault(state, &keys)
+    save_credentials(state, &keys)
 }
 
 fn delete_key(state: &AppState, connection_id: &str) -> AppResult<()> {
-    let mut keys = cached_key_vault(state)?;
+    let mut keys = cached_credentials(state)?;
     if keys.remove(connection_id).is_some() {
-        save_key_vault(state, &keys)?;
+        save_credentials(state, &keys)?;
     }
     Ok(())
 }
@@ -1132,39 +1315,32 @@ async fn generate_audio(
     voice: String,
     cancellation: CancellationToken,
 ) -> AppResult<GeneratedMedia> {
+    if uses_chat_audio_endpoint(&provider_kind, &model_id) {
+        let request = http_client()?
+            .post(chat_endpoint(base_url))
+            .bearer_auth(api_key)
+            .json(&chat_audio_request_body(&model_id, &prompt, &voice))
+            .send();
+        let response = tokio::select! {
+            _ = cancellation.cancelled() => return Err(AppError::new("CANCELLED", "本次运行已结束。", false)),
+            response = request => response.map_err(|error| connection_error(&error, "音频生成接口"))?,
+        };
+        let status = response.status();
+        if !status.is_success() {
+            let body = response.text().await.unwrap_or_default();
+            return Err(provider_error(status, &body));
+        }
+        let body = response.json().await.map_err(|_| {
+            AppError::new("RESPONSE_INVALID", "模型返回了无法识别的音频数据。", false)
+        })?;
+        return parse_chat_audio_response(body);
+    }
     let response_format = if model_id.to_lowercase().contains("gemini") {
         "wav"
     } else {
         "mp3"
     };
-    let voice = if provider_kind == "siliconflow" {
-        match voice.as_str() {
-            "echo" => "alex",
-            "fable" => "claire",
-            "onyx" => "benjamin",
-            "nova" => "diana",
-            "shimmer" => "bella",
-            _ => "anna",
-        }
-        .to_string()
-    } else {
-        voice
-    };
-    let mut body = serde_json::json!({
-        "model": model_id.clone(),
-        "input": prompt,
-        "voice": voice,
-        "response_format": response_format
-    });
-    if provider_kind == "siliconflow" {
-        if model_id.to_lowercase().contains("moss-ttsd") {
-            body.as_object_mut()
-                .expect("audio request is an object")
-                .remove("voice");
-        } else if let Some(voice) = body.get_mut("voice") {
-            *voice = format!("{model_id}:{}", voice.as_str().unwrap_or("anna")).into();
-        }
-    }
+    let body = speech_request_body(&provider_kind, &model_id, &prompt, &voice, response_format);
     let request = http_client()?
         .post(audio_endpoint(base_url))
         .bearer_auth(api_key)
@@ -1178,6 +1354,46 @@ async fn generate_audio(
     if !status.is_success() {
         let body = response.text().await.unwrap_or_default();
         return Err(provider_error(status, &body));
+    }
+    let returns_result_link = provider_kind == "aihubmix"
+        && model_id.to_ascii_lowercase().contains("qwen-audio-3.0-tts")
+        && response
+            .headers()
+            .get(reqwest::header::CONTENT_TYPE)
+            .and_then(|value| value.to_str().ok())
+            .is_some_and(|value| value.contains("json"));
+    if returns_result_link {
+        let body: serde_json::Value = response.json().await.map_err(|_| {
+            AppError::new("RESPONSE_INVALID", "模型返回了无法识别的音频链接。", false)
+        })?;
+        let result_url = qwen_audio_result_url(&body).ok_or_else(|| {
+            AppError::new("RESPONSE_INVALID", "模型没有返回可下载的音频链接。", false)
+        })?;
+        let download = http_client()?.get(result_url).send();
+        let download = tokio::select! {
+            _ = cancellation.cancelled() => return Err(AppError::new("CANCELLED", "本次运行已结束。", false)),
+            response = download => response.map_err(|error| connection_error(&error, "音频下载接口"))?,
+        };
+        let status = download.status();
+        if !status.is_success() {
+            return Err(
+                AppError::new("PROVIDER_ERROR", "模型已生成音频，但下载失败。", true)
+                    .status(status),
+            );
+        }
+        return Ok(GeneratedMedia {
+            data_url: response_data_url(
+                download,
+                if response_format == "wav" {
+                    "audio/wav"
+                } else {
+                    "audio/mpeg"
+                },
+                25 * 1024 * 1024,
+                cancellation,
+            )
+            .await?,
+        });
     }
     Ok(GeneratedMedia {
         data_url: response_data_url(
@@ -1207,10 +1423,10 @@ async fn transcribe_audio(
     let bytes = BASE64
         .decode(encoded)
         .map_err(|_| AppError::new("VALIDATION_ERROR", "无法读取音频文件。", false))?;
-    if bytes.len() > 50 * 1024 * 1024 {
+    if bytes.len() > 25 * 1024 * 1024 {
         return Err(AppError::new(
             "VALIDATION_ERROR",
-            "音频文件不能超过 50 MB。",
+            "音频文件不能超过 25 MB。",
             false,
         ));
     }
@@ -1218,8 +1434,10 @@ async fn transcribe_audio(
         .strip_prefix("data:")
         .and_then(|value| value.split(';').next())
         .unwrap_or("audio/mpeg");
+    let file_name = audio_file_name(mime)?;
+    validate_audio_payload(mime, &bytes)?;
     let part = reqwest::multipart::Part::bytes(bytes)
-        .file_name("audio")
+        .file_name(file_name)
         .mime_str(mime)
         .map_err(|_| AppError::new("VALIDATION_ERROR", "音频格式不受支持。", false))?;
     let request = http_client()?
@@ -1249,7 +1467,13 @@ async fn transcribe_audio(
         .and_then(serde_json::Value::as_str)
         .map(str::trim)
         .filter(|text| !text.is_empty())
-        .ok_or_else(|| AppError::new("RESPONSE_INVALID", "模型没有返回转写文本。", false))?
+        .ok_or_else(|| {
+            AppError::new(
+                "RESPONSE_INVALID",
+                "模型没有识别到语音，请确认音频可以正常播放且包含清晰人声。",
+                false,
+            )
+        })?
         .to_string();
     Ok(GeneratedText { text, usage: None })
 }
@@ -1598,19 +1822,6 @@ fn settings_get(state: State<'_, AppState>) -> AppResult<AppConfig> {
     load_config(&state.config_path)
 }
 
-#[tauri::command]
-fn connection_key_get(connection_id: String, state: State<'_, AppState>) -> AppResult<String> {
-    let config = load_config(&state.config_path)?;
-    if !config
-        .connections
-        .iter()
-        .any(|connection| connection.id == connection_id)
-    {
-        return Err(AppError::new("NOT_FOUND", "没有找到这个连接。", false));
-    }
-    get_key(state.inner(), &connection_id)
-}
-
 fn activate_output_type(config: &mut AppConfig, output_type: &str) {
     config.active_arena_type = output_type.to_string();
 }
@@ -1619,18 +1830,6 @@ fn activate_output_type(config: &mut AppConfig, output_type: &str) {
 fn arena_type_set(output_type: String, state: State<'_, AppState>) -> AppResult<AppConfig> {
     validate_output_type(&output_type)?;
     let mut config = load_config(&state.config_path)?;
-    if !config
-        .connections
-        .iter()
-        .flat_map(|connection| &connection.models)
-        .any(|model| model.output_type == output_type)
-    {
-        return Err(AppError::new(
-            "VALIDATION_ERROR",
-            "当前没有这一类模型。",
-            false,
-        ));
-    }
     activate_output_type(&mut config, &output_type);
     save_config(&state.config_path, &config)?;
     Ok(config)
@@ -1692,40 +1891,32 @@ async fn validate_integrated_key(
     api_key: &str,
     text_models: &[CatalogOption],
 ) -> AppResult<()> {
-    let response = if provider_kind == "siliconflow" {
-        let mut endpoint = base_url;
-        endpoint.set_path(&format!(
-            "{}/user/info",
-            endpoint.path().trim_end_matches('/')
-        ));
-        client
-            .get(endpoint)
-            .bearer_auth(api_key)
-            .timeout(Duration::from_secs(15))
-            .send()
-            .await
-            .map_err(|error| connection_error(&error, "硅基流动"))?
-    } else {
-        let model_id = text_probe_model(text_models).ok_or_else(|| {
-            AppError::new(
-                "RESPONSE_INVALID",
-                "平台没有可用于验证 Key 的文本模型。",
-                false,
-            )
-        })?;
-        client
-            .post(chat_endpoint(base_url))
-            .bearer_auth(api_key)
-            .timeout(Duration::from_secs(30))
-            .json(&chat_request_body(
-                model_id,
-                serde_json::Value::String("1".into()),
-                Some(1),
-            ))
-            .send()
-            .await
-            .map_err(|error| connection_error(&error, "AIHubMix"))?
-    };
+    // SiliconFlow retired /user/info on 2026-08-14. provider_models has already
+    // completed an authenticated /models request before this function is called,
+    // so that successful catalog response is the connection validation.
+    if provider_kind == "siliconflow" {
+        return Ok(());
+    }
+
+    let model_id = text_probe_model(text_models).ok_or_else(|| {
+        AppError::new(
+            "RESPONSE_INVALID",
+            "平台没有可用于验证 Key 的文本模型。",
+            false,
+        )
+    })?;
+    let response = client
+        .post(chat_endpoint(base_url))
+        .bearer_auth(api_key)
+        .timeout(Duration::from_secs(30))
+        .json(&chat_request_body(
+            model_id,
+            serde_json::Value::String("1".into()),
+            Some(1),
+        ))
+        .send()
+        .await
+        .map_err(|error| connection_error(&error, "AIHubMix"))?;
     let status = response.status();
     if status.is_success() {
         return Ok(());
@@ -1794,7 +1985,7 @@ fn provider_name(provider_kind: &str) -> &'static str {
 }
 
 fn should_probe_selected_models(provider_kind: &str, output_type: &str) -> bool {
-    output_type == "text" && provider_kind != "openai_compatible"
+    matches!(output_type, "text" | "all") && provider_kind != "openai_compatible"
 }
 
 #[tauri::command]
@@ -1802,7 +1993,7 @@ async fn provider_models(
     input: ConnectionProbeInput,
     state: State<'_, AppState>,
 ) -> AppResult<CatalogResult> {
-    validate_output_type(&input.output_type)?;
+    validate_catalog_filter(&input.output_type)?;
     let (normalized_base, base_url) = normalize_base(&input.base_url)?;
     let key = effective_key(
         state.inner(),
@@ -1811,14 +2002,55 @@ async fn provider_models(
     )?;
     let target = provider_name(&input.provider_kind);
     let client = http_client()?;
-    let mut models = fetch_catalog(
-        &client,
-        models_endpoint(&input.provider_kind, &input.output_type, base_url.clone()),
-        &key,
-        target,
-        &input.output_type,
-    )
-    .await?;
+    let models = if input.output_type == "all" {
+        let requests = ["text", "image", "audio", "audio_to_text", "video"]
+            .into_iter()
+            .map(|output_type| {
+                fetch_catalog(
+                    &client,
+                    models_endpoint(&input.provider_kind, output_type, base_url.clone()),
+                    &key,
+                    target,
+                    output_type,
+                )
+            });
+        let mut models = Vec::new();
+        let mut first_error = None;
+        for result in join_all(requests).await {
+            match result {
+                Ok(catalog) => models.extend(catalog),
+                Err(error) if error.code == "AUTH_FAILED" => return Err(error),
+                Err(error) => {
+                    if first_error.is_none() {
+                        first_error = Some(error);
+                    }
+                }
+            }
+        }
+        if models.is_empty() {
+            return Err(first_error.unwrap_or_else(|| {
+                AppError::new("RESPONSE_INVALID", "平台没有返回可用模型。", false)
+            }));
+        }
+        models.sort_unstable_by(|left, right| {
+            left.output_type
+                .cmp(&right.output_type)
+                .then_with(|| left.model_id.to_lowercase().cmp(&right.model_id.to_lowercase()))
+        });
+        models.dedup_by(|left, right| {
+            left.output_type == right.output_type && left.model_id == right.model_id
+        });
+        models
+    } else {
+        fetch_catalog(
+            &client,
+            models_endpoint(&input.provider_kind, &input.output_type, base_url.clone()),
+            &key,
+            target,
+            &input.output_type,
+        )
+        .await?
+    };
     if input
         .api_key
         .as_deref()
@@ -1827,6 +2059,14 @@ async fn provider_models(
     {
         let text_models = if input.provider_kind != "aihubmix" || input.output_type == "text" {
             None
+        } else if input.output_type == "all" {
+            Some(
+                models
+                    .iter()
+                    .filter(|model| model.output_type == "text")
+                    .cloned()
+                    .collect(),
+            )
         } else {
             Some(
                 fetch_catalog(
@@ -1847,25 +2087,6 @@ async fn provider_models(
             text_models.as_deref().unwrap_or(&models),
         )
         .await?;
-    }
-    if input.output_type == "audio" {
-        let speech_to_text = fetch_catalog(
-            &client,
-            models_endpoint(&input.provider_kind, "audio_to_text", base_url),
-            &key,
-            target,
-            "audio_to_text",
-        )
-        .await?;
-        if input.provider_kind == "siliconflow" {
-            models.retain(|model| {
-                !speech_to_text
-                    .iter()
-                    .any(|speech| speech.model_id == model.model_id)
-            });
-        }
-        models.extend(speech_to_text);
-        models.sort_unstable_by_key(|model| model.model_id.to_lowercase());
     }
     let fingerprint = connection_fingerprint(
         input.connection_id.as_deref(),
@@ -1975,14 +2196,15 @@ async fn connection_save(
     mut input: ConnectionInput,
     state: State<'_, AppState>,
 ) -> AppResult<ConnectionSaveResult> {
-    validate_output_type(&input.output_type)?;
+    validate_catalog_filter(&input.output_type)?;
     if input.display_name.trim().is_empty() {
         return Err(AppError::new("VALIDATION_ERROR", "请输入连接名称。", false));
     }
     if input.models.is_empty()
         || input.models.iter().any(|model| {
             model.model_id.trim().is_empty()
-                || output_category(&model.output_type) != output_category(&input.output_type)
+                || validate_output_type(&model.output_type).is_err()
+                || (input.output_type != "all" && model.output_type != input.output_type)
         })
     {
         return Err(AppError::new(
@@ -2022,18 +2244,29 @@ async fn connection_save(
     if should_probe_selected_models(&input.provider_kind, &input.output_type) {
         let target = provider_name(&input.provider_kind);
         let client = http_client()?;
-        let probes = input.models.iter().map(|model| {
-            probe_text_model(
-                client.clone(),
-                base_url.clone(),
-                key.clone(),
-                model.model_id.trim().to_string(),
-                target,
-            )
+        let probes = input.models.clone().into_iter().map(|model| {
+            let client = client.clone();
+            let base_url = base_url.clone();
+            let key = key.clone();
+            async move {
+                let result = if model.output_type == "text" {
+                    probe_text_model(
+                        client,
+                        base_url,
+                        key,
+                        model.model_id.trim().to_string(),
+                        target,
+                    )
+                    .await
+                } else {
+                    Ok(())
+                };
+                (model, result)
+            }
         });
         let results = join_all(probes).await;
         let mut available = Vec::new();
-        for (model, result) in input.models.into_iter().zip(results) {
+        for (model, result) in results {
             match result {
                 Ok(()) => available.push(model),
                 Err(error) if can_skip_failed_model(&error) => skipped_models.push(SkippedModel {
@@ -2089,7 +2322,6 @@ async fn connection_save(
         Vec::new()
     };
     let output_type = input.output_type.clone();
-    let edited_category = output_category(&output_type).to_string();
     let _ = input.supports_reference_image;
     let selected_models = input
         .models
@@ -2118,7 +2350,7 @@ async fn connection_save(
     let mut models = existing_models
         .into_iter()
         .filter(|model| {
-            output_category(&model.output_type) != edited_category
+            (output_type != "all" && model.output_type != output_type)
                 && !selected_models
                     .iter()
                     .any(|selected| selected.model_id == model.model_id)
@@ -2261,6 +2493,75 @@ fn connection_remove(connection_id: String, state: State<'_, AppState>) -> AppRe
         return Err(error);
     }
     Ok(true)
+}
+
+fn save_audio_data_url(
+    download_dir: &Path,
+    data_url: &str,
+    model_name: &str,
+) -> AppResult<PathBuf> {
+    let (header, encoded) = data_url
+        .split_once(',')
+        .ok_or_else(|| AppError::new("VALIDATION_ERROR", "无法读取生成音频。", false))?;
+    let mime = header
+        .strip_prefix("data:")
+        .and_then(|value| value.split(';').next())
+        .ok_or_else(|| AppError::new("VALIDATION_ERROR", "无法识别生成音频格式。", false))?;
+    let extension = match mime {
+        "audio/mpeg" | "audio/mp3" => "mp3",
+        "audio/wav" | "audio/x-wav" | "audio/wave" => "wav",
+        "audio/opus" => "opus",
+        "audio/aac" => "aac",
+        "audio/flac" => "flac",
+        _ => {
+            return Err(AppError::new(
+                "VALIDATION_ERROR",
+                "生成音频格式不支持下载。",
+                false,
+            ));
+        }
+    };
+    let bytes = BASE64
+        .decode(encoded)
+        .map_err(|_| AppError::new("VALIDATION_ERROR", "生成音频数据已损坏。", false))?;
+    if bytes.len() > 25 * 1024 * 1024 {
+        return Err(AppError::new(
+            "VALIDATION_ERROR",
+            "生成音频不能超过 25 MB。",
+            false,
+        ));
+    }
+    let stem = model_name
+        .chars()
+        .map(|character| {
+            if character.is_ascii_alphanumeric() || matches!(character, '-' | '_' | '.') {
+                character
+            } else {
+                '_'
+            }
+        })
+        .collect::<String>();
+    let stem = stem.trim_matches(|character| character == '.' || character == '_');
+    let stem = if stem.is_empty() { "audio" } else { stem };
+    let folder = download_dir.join("Model Battle");
+    fs::create_dir_all(&folder)
+        .map_err(|_| AppError::new("FILE_WRITE_FAILED", "无法创建音频下载目录。", true))?;
+    let suffix = Uuid::new_v4().simple().to_string();
+    let path = folder.join(format!("{stem}-{}.{}", &suffix[..8], extension));
+    fs::write(&path, bytes)
+        .map_err(|_| AppError::new("FILE_WRITE_FAILED", "无法保存生成音频。", true))?;
+    Ok(path)
+}
+
+#[tauri::command]
+fn audio_save(data_url: String, model_name: String, app: tauri::AppHandle) -> AppResult<String> {
+    let download_dir = app
+        .path()
+        .download_dir()
+        .map_err(|_| AppError::new("FILE_WRITE_FAILED", "无法读取下载目录。", true))?;
+    Ok(save_audio_data_url(&download_dir, &data_url, &model_name)?
+        .to_string_lossy()
+        .into_owned())
 }
 
 #[tauri::command]
@@ -2575,9 +2876,11 @@ pub fn run() {
     tauri::Builder::default()
         .setup(|app| {
             let config_path = app.path().app_config_dir()?.join("config.json");
+            let credentials_path = config_path.with_file_name(CREDENTIALS_FILE_NAME);
             app.manage(AppState {
                 config_path,
-                key_vault: Arc::new(Mutex::new(None)),
+                credentials_path,
+                credential_cache: Arc::new(Mutex::new(None)),
                 validated_connections: Arc::new(Mutex::new(HashMap::new())),
                 current_run: Arc::new(Mutex::new(None)),
             });
@@ -2585,7 +2888,6 @@ pub fn run() {
         })
         .invoke_handler(tauri::generate_handler![
             settings_get,
-            connection_key_get,
             provider_models,
             connection_test,
             connection_save,
@@ -2594,6 +2896,7 @@ pub fn run() {
             model_remove,
             models_clear,
             connection_remove,
+            audio_save,
             text_run_start,
             text_run_cancel
         ])
@@ -2755,6 +3058,86 @@ mod tests {
     }
 
     #[test]
+    fn builds_provider_specific_audio_requests() {
+        let silicon = speech_request_body(
+            "siliconflow",
+            "FunAudioLLM/CosyVoice2-0.5B",
+            "你好",
+            "echo",
+            "mp3",
+        );
+        assert_eq!(silicon["voice"], "FunAudioLLM/CosyVoice2-0.5B:alex");
+        assert_eq!(silicon["input"], "你好");
+
+        let moss =
+            speech_request_body("siliconflow", "fnlp/MOSS-TTSD-v0.5", "你好", "alloy", "mp3");
+        assert_eq!(moss["voice"], "fnlp/MOSS-TTSD-v0.5:anna");
+        assert_eq!(moss["input"], "[S1]你好");
+
+        let openai = speech_request_body("aihubmix", "tts-1", "hello", "alloy", "mp3");
+        assert_eq!(openai["voice"], "alloy");
+        assert_eq!(openai["input"], "hello");
+
+        let qwen_plus = speech_request_body(
+            "aihubmix",
+            "qwen-audio-3.0-tts-plus",
+            "你好",
+            "alloy",
+            "mp3",
+        );
+        assert_eq!(qwen_plus["voice"], "longanlingxin");
+        let qwen_flash = speech_request_body(
+            "aihubmix",
+            "qwen-audio-3.0-tts-flash",
+            "你好",
+            "nova",
+            "mp3",
+        );
+        assert_eq!(qwen_flash["voice"], "longanxiaoxin");
+    }
+
+    #[test]
+    fn supports_aihubmix_chat_audio_models() {
+        assert!(uses_chat_audio_endpoint("aihubmix", "gpt-4o-audio-preview"));
+        assert!(!uses_chat_audio_endpoint("aihubmix", "gpt-4o-mini-tts"));
+        let body = chat_audio_request_body("gpt-4o-audio-preview", "hello", "nova");
+        assert_eq!(body["modalities"], serde_json::json!(["text", "audio"]));
+        assert_eq!(body["audio"]["voice"], "nova");
+
+        let output = parse_chat_audio_response(serde_json::json!({
+            "choices": [{"message": {"audio": {"data": "YWJj"}}}]
+        }))
+        .expect("audio response");
+        assert_eq!(output.data_url, "data:audio/wav;base64,YWJj");
+        assert_eq!(
+            qwen_audio_result_url(&serde_json::json!({
+                "output": {"audio": {"url": "https://example.com/audio.mp3"}}
+            })),
+            Some("https://example.com/audio.mp3")
+        );
+    }
+
+    #[test]
+    fn assigns_supported_extensions_to_transcription_uploads() {
+        assert_eq!(audio_file_name("audio/mpeg").unwrap(), "audio.mp3");
+        assert_eq!(audio_file_name("audio/x-m4a").unwrap(), "audio.m4a");
+        assert_eq!(audio_file_name("audio/wav").unwrap(), "audio.wav");
+        assert!(audio_file_name("audio/ogg").is_err());
+    }
+
+    #[test]
+    fn rejects_wav_files_without_an_audio_data_chunk() {
+        let mut valid = b"RIFF\x28\x00\x00\x00WAVEdata\x04\x00\x00\x00".to_vec();
+        valid.extend_from_slice(&[1, 2, 3, 4]);
+        assert!(validate_audio_payload("audio/wav", &valid).is_ok());
+
+        let filler_only = b"RIFF\x28\x00\x00\x00WAVEFLLR\x04\x00\x00\x00\x00\x00\x00\x00";
+        let error = validate_audio_payload("audio/wav", filler_only).unwrap_err();
+        assert!(error.message.contains("不含有效音轨"));
+        assert!(validate_audio_payload("audio/mpeg", b"opaque compressed audio").is_ok());
+    }
+
+    #[test]
     fn changing_arena_type_keeps_other_models_enabled() {
         let mut config = AppConfig {
             schema_version: SCHEMA_VERSION,
@@ -2788,6 +3171,17 @@ mod tests {
         activate_output_type(&mut config, "image");
         assert_eq!(config.active_arena_type, "image");
         assert!(config.connections[0].models[0].enabled);
+    }
+
+    #[test]
+    fn changing_to_an_empty_arena_type_is_allowed() {
+        let mut config = AppConfig {
+            schema_version: SCHEMA_VERSION,
+            active_arena_type: "text".into(),
+            connections: Vec::new(),
+        };
+        activate_output_type(&mut config, "video");
+        assert_eq!(config.active_arena_type, "video");
     }
 
     #[test]
@@ -3094,6 +3488,41 @@ mod tests {
         fs::write(&path, b"not json").expect("corrupt current config");
         let recovered = load_config(&path).expect("backup should recover");
         assert_eq!(recovered.active_arena_type, "text");
+        fs::remove_dir_all(directory).expect("cleanup");
+    }
+
+    #[test]
+    fn credentials_round_trip_in_app_data_file() {
+        let directory = std::env::temp_dir().join(format!("model-battle-{}", Uuid::new_v4()));
+        let path = directory.join(CREDENTIALS_FILE_NAME);
+        let keys = HashMap::from([("connection-1".to_string(), "secret-key".to_string())]);
+        write_credentials(&path, &keys).expect("save credentials");
+        assert_eq!(read_credentials(&path).expect("read credentials"), keys);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            assert_eq!(
+                fs::metadata(&path).expect("metadata").permissions().mode() & 0o777,
+                0o600
+            );
+        }
+        fs::remove_dir_all(directory).expect("cleanup");
+    }
+
+    #[test]
+    fn saves_generated_audio_to_a_download_folder() {
+        let directory = std::env::temp_dir().join(format!("model-battle-{}", Uuid::new_v4()));
+        let path = save_audio_data_url(&directory, "data:audio/mpeg;base64,YWJj", "qwen/audio")
+            .expect("save audio");
+        assert_eq!(
+            path.parent(),
+            Some(directory.join("Model Battle").as_path())
+        );
+        assert_eq!(
+            path.extension().and_then(|value| value.to_str()),
+            Some("mp3")
+        );
+        assert_eq!(fs::read(&path).expect("read audio"), b"abc");
         fs::remove_dir_all(directory).expect("cleanup");
     }
 

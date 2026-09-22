@@ -77,6 +77,13 @@ npm run tauri build
 4. 一次运行当前类型下全部已启用模型，检查输出、耗时和真实 Token；接口不返回 usage 时显示 `--`。
 5. 完全退出后重启，模型配置应保留，上一轮提示词和结果应清空。
 
+### 音频 Battle 验收
+
+- 文本转音频：标准 TTS 模型调用 `/audio/speech`；AIHubMix 的 `gpt-4o-audio-preview` 按其要求调用 `/chat/completions` 并解析 Base64 WAV。
+- 硅基流动：系统音色会转换成模型限定的 `模型 ID:音色` 格式；MOSS-TTSD 的单说话人输入会补齐 `[S1]` 标记。
+- 音频转文本：上传使用 `/audio/transcriptions`，支持 mp3、mp4、mpeg、mpga、m4a、wav、webm，统一限制为 25 MB，并保留可供服务端识别的文件扩展名。
+- 自动化测试只验证界面、请求路由、请求体和响应解析。发布前仍需分别使用有效的 AIHubMix、硅基流动 Key 完成一次 TTS 与 STT 真机冒烟；这一步会产生实际 API 调用和费用。
+
 API Key 仅进入 macOS Keychain，不得写入文档、`.env`、终端命令或 Git。
 
 非敏感模型配置保存在本地 JSON 文件中，并保留备份用于损坏恢复。

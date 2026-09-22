@@ -14,6 +14,8 @@ type AppError = {
 type ProviderKind = "aihubmix" | "siliconflow" | "openai_compatible";
 type OutputType = "text" | "image" | "audio" | "audio_to_text" | "video";
 type ModelCategory = "text" | "image" | "audio" | "video";
+type CatalogFilter = OutputType | "all";
+type ReasoningFilter = "all" | "reasoning" | "non_reasoning";
 
 type CatalogModel = {
   modelId: string;
@@ -88,6 +90,7 @@ type EditorState = {
   providerKind: ProviderKind;
   modelCategory: ModelCategory;
   outputType: OutputType;
+  catalogFilter: CatalogFilter;
   displayName: string;
   baseUrl: string;
   apiKey: string;
@@ -96,12 +99,16 @@ type EditorState = {
   connected: boolean;
   catalog: CatalogModel[];
   catalogQuery: string;
+  parameterLimitEnabled: boolean;
+  maxParameterBillions: string;
+  reasoningFilter: ReasoningFilter;
   selectedModels: string[];
   imageCapableModels: string[];
   validationToken: string;
 };
 
 const emptyConfig: AppConfig = { schemaVersion: 1, activeArenaType: "text", connections: [] };
+const credentialMask = "••••••••";
 const providerDefaults: Record<ProviderKind, { name: string; baseUrl: string }> = {
   aihubmix: { name: "AIHubMix", baseUrl: "https://aihubmix.com/v1" },
   siliconflow: { name: "硅基流动", baseUrl: "https://api.siliconflow.cn/v1" },
@@ -115,6 +122,16 @@ const settingsGroups: Array<{ label: string; outputType: OutputType }> = [
   { label: "音频转文本", outputType: "audio_to_text" },
   { label: "视频生成模型", outputType: "video" },
 ];
+const audioFileAccept = ".mp3,.mp4,.mpeg,.mpga,.m4a,.wav,.webm,audio/mpeg,audio/mp4,audio/wav,audio/webm,video/mp4,video/webm";
+const supportedAudioExtension = /\.(mp3|mp4|mpeg|mpga|m4a|wav|webm)$/i;
+
+function audioMimeType(fileName: string) {
+  const extension = fileName.split(".").pop()?.toLowerCase();
+  if (extension === "mp4" || extension === "m4a") return "audio/mp4";
+  if (extension === "wav") return "audio/wav";
+  if (extension === "webm") return "audio/webm";
+  return "audio/mpeg";
+}
 
 function TrashIcon() {
   return <svg viewBox="0 0 24 24" aria-hidden="true">
@@ -130,6 +147,12 @@ function EditIcon() {
 
 function PlusIcon() {
   return <svg viewBox="0 0 16 16" aria-hidden="true"><path d="M8 3v10M3 8h10" /></svg>;
+}
+
+function DownloadIcon() {
+  return <svg viewBox="0 0 20 20" aria-hidden="true">
+    <path d="M10 3v9m-3-3 3 3 3-3M4 15v2h12v-2" />
+  </svg>;
 }
 
 function ToastIcon({ success }: { success: boolean }) {
@@ -209,6 +232,7 @@ function newEditor(providerKind: ProviderKind): EditorState {
     providerKind,
     modelCategory: "text",
     outputType: "text",
+    catalogFilter: "text",
     displayName: defaults.name,
     baseUrl: defaults.baseUrl,
     apiKey: "",
@@ -217,6 +241,9 @@ function newEditor(providerKind: ProviderKind): EditorState {
     connected: false,
     catalog: [],
     catalogQuery: "",
+    parameterLimitEnabled: false,
+    maxParameterBillions: "14",
+    reasoningFilter: "all",
     selectedModels: [],
     imageCapableModels: [],
     validationToken: "",
@@ -242,6 +269,47 @@ function providerLabel(kind: ProviderKind) {
   return providerDefaults[kind].name;
 }
 
+function modelParameterBillions(modelId: string) {
+  const pattern = /(\d+(?:\.\d+)?)\s*(?:x|×)\s*(\d+(?:\.\d+)?)\s*b(?![a-z0-9])|(\d+(?:\.\d+)?)\s*b(?![a-z0-9])/gi;
+  const sizes: number[] = [];
+  for (const match of modelId.matchAll(pattern)) {
+    const size = match[1] && match[2]
+      ? Number(match[1]) * Number(match[2])
+      : Number(match[3]);
+    if (Number.isFinite(size)) sizes.push(size);
+  }
+  return sizes.length ? Math.max(...sizes) : undefined;
+}
+
+function isModelAtMostBillions(modelId: string, maximum: number) {
+  const parameterBillions = modelParameterBillions(modelId);
+  return parameterBillions !== undefined && parameterBillions <= maximum;
+}
+
+function modelParameterLabel(modelId: string) {
+  const parameterBillions = modelParameterBillions(modelId);
+  return parameterBillions === undefined ? undefined : `${parameterBillions}B`;
+}
+
+function modelCapabilityLabels(model: CatalogModel) {
+  const labels = capabilityLabels(model.outputType, model.supportsReferenceImage);
+  const parameterLabel = modelParameterLabel(model.modelId);
+  if (parameterLabel) labels.splice(Math.max(labels.length - 1, 0), 0, parameterLabel);
+  return labels;
+}
+
+function isReasoningModel(modelId: string) {
+  const normalized = modelId.toLowerCase();
+  return [
+    /(^|[\/_-])(?:deepseek-)?r1(?:$|[\/_\-.])/,
+    /(^|[\/_-])qwq(?:$|[\/_\-.])/,
+    /(^|[\/_-])(?:o1|o3|o4)(?:$|[\/_\-.])/,
+    /(^|[\/_-])glm-z1(?:$|[\/_\-.])/,
+    /(^|[\/_-])magistral(?:$|[\/_\-.])/,
+    /reasoner|reasoning|thinking/,
+  ].some((pattern) => pattern.test(normalized));
+}
+
 function modelCategoryLabel(model: ModelConfig) {
   return categoryLabel(categoryOfModel(model));
 }
@@ -263,6 +331,16 @@ function categoryLabel(category: ModelCategory) {
   }[category];
 }
 
+function arenaTypeLabel(outputType: OutputType) {
+  return {
+    text: "文本生成模型",
+    image: "图片生成模型",
+    audio: "文本转音频",
+    audio_to_text: "音频转文本",
+    video: "视频生成模型",
+  }[outputType];
+}
+
 function capabilityLabels(outputType: OutputType, supportsReferenceImage: boolean) {
   if (outputType === "text") return ["文本生成", ...(supportsReferenceImage ? ["支持图片理解"] : [])];
   if (outputType === "image") return ["文生图", ...(supportsReferenceImage ? ["支持参考图"] : [])];
@@ -282,7 +360,7 @@ export default function App() {
   const [config, setConfig] = useState<AppConfig>(emptyConfig);
   const [loading, setLoading] = useState(true);
   const [activePage, setActivePage] = useState<"arena" | "settings">("arena");
-  const [settingsCategory, setSettingsCategory] = useState<ModelCategory>("text");
+  const [settingsOutputType, setSettingsOutputType] = useState<OutputType>("text");
   const [sourceFilters, setSourceFilters] = useState<ProviderKind[]>(["aihubmix", "siliconflow", "openai_compatible"]);
   const [editor, setEditor] = useState<EditorState>();
   const [busy, setBusy] = useState(false);
@@ -324,7 +402,7 @@ export default function App() {
   )), [configuredConnections]);
 
   const settingsModelGroups = useMemo(() => settingsGroups
-    .filter((group) => categoryOfOutput(group.outputType) === settingsCategory)
+    .filter((group) => group.outputType === settingsOutputType)
     .map((group) => ({
       ...group,
       models: config.connections
@@ -332,7 +410,7 @@ export default function App() {
         .flatMap((connection) => connection.models
           .filter((model) => model.outputType === group.outputType)
           .map((model) => ({ connection, model }))),
-    })), [config, settingsCategory, sourceFilters]);
+    })), [config, settingsOutputType, sourceFilters]);
 
   async function refreshSettings() {
     try {
@@ -407,34 +485,30 @@ export default function App() {
       ? config.activeArenaType
       : connection.models[0]?.outputType ?? "text";
     const modelCategory = categoryOfOutput(outputType);
-    const models = connection.models.filter((model) => categoryOfModel(model) === modelCategory);
+    const models = connection.models.filter((model) => model.outputType === outputType);
     setEditor({
       connectionId: connection.id,
       hasCredential: connection.hasCredential,
       providerKind: connection.providerKind,
       modelCategory,
       outputType,
+      catalogFilter: outputType,
       displayName: connection.displayName,
       baseUrl: connection.baseUrl,
-      apiKey: "",
+      apiKey: connection.hasCredential ? credentialMask : "",
       modelId: connection.providerKind === "openai_compatible" ? models[0]?.modelId ?? connection.models[0]?.modelId ?? "" : "",
       savedModels: connection.models,
       connected: true,
       catalog: models.map((model) => ({ modelId: model.modelId, outputType: model.outputType, supportsReferenceImage: model.supportsReferenceImage })),
       catalogQuery: "",
+      parameterLimitEnabled: false,
+      maxParameterBillions: "14",
+      reasoningFilter: "all",
       selectedModels: models.map((model) => model.modelId),
       imageCapableModels: connection.models.filter((model) => model.supportsReferenceImage).map((model) => model.modelId),
       validationToken: "",
     });
     setNotice("");
-    void invoke<string>("connection_key_get", { connectionId: connection.id })
-      .then((apiKey) => setEditor((current) => (
-        current?.connectionId === connection.id && !current.apiKey ? { ...current, apiKey } : current
-      )))
-      .catch((error) => {
-        setNotice(messageFrom(error));
-        setNoticeSuccess(false);
-      });
   }
 
   function updateEditor(field: "displayName" | "baseUrl" | "apiKey" | "modelId", value: string) {
@@ -451,6 +525,7 @@ export default function App() {
         ...current,
         modelCategory,
         outputType,
+        catalogFilter: outputType,
         modelId: current.providerKind === "openai_compatible" ? models[0]?.modelId ?? current.modelId : current.modelId,
         catalog: models.map((model) => ({ modelId: model.modelId, outputType: model.outputType, supportsReferenceImage: model.supportsReferenceImage })),
         catalogQuery: "",
@@ -461,16 +536,38 @@ export default function App() {
     setNotice("");
   }
 
-  async function selectEditorCategory(modelCategory: ModelCategory) {
-    setEditorCategory(modelCategory);
+  function setIntegratedCatalogFilter(catalogFilter: CatalogFilter) {
+    setEditor((current) => {
+      if (!current) return current;
+      const models = catalogFilter === "all"
+        ? current.savedModels
+        : current.savedModels.filter((model) => model.outputType === catalogFilter);
+      return {
+        ...current,
+        modelCategory: catalogFilter === "all" ? current.modelCategory : categoryOfOutput(catalogFilter),
+        outputType: catalogFilter === "all" ? current.outputType : catalogFilter,
+        catalogFilter,
+        catalog: models.map((model) => ({ modelId: model.modelId, outputType: model.outputType, supportsReferenceImage: model.supportsReferenceImage })),
+        catalogQuery: "",
+        parameterLimitEnabled: catalogFilter === "text" ? current.parameterLimitEnabled : false,
+        reasoningFilter: catalogFilter === "text" ? current.reasoningFilter : "all",
+        selectedModels: models.map((model) => model.modelId),
+        validationToken: "",
+      };
+    });
+    setNotice("");
+  }
+
+  async function selectEditorCatalogFilter(catalogFilter: CatalogFilter) {
+    setIntegratedCatalogFilter(catalogFilter);
     if (editor?.providerKind !== "openai_compatible" && editor?.connected) {
-      await loadModels(modelCategory);
+      await loadModels(catalogFilter);
     }
   }
 
-  async function loadModels(modelCategory = editor?.modelCategory) {
+  async function loadModels(catalogFilter = editor?.catalogFilter) {
     if (!editor) return;
-    const outputType = modelCategory ? categoryOutputType(modelCategory) : editor.outputType;
+    if (!catalogFilter) return;
     setBusy(true);
     setNotice("");
     try {
@@ -479,8 +576,8 @@ export default function App() {
           connectionId: editor.connectionId,
           providerKind: editor.providerKind,
           baseUrl: editor.baseUrl,
-          apiKey: editor.apiKey || undefined,
-          outputType,
+          apiKey: editor.apiKey === credentialMask ? undefined : editor.apiKey || undefined,
+          outputType: catalogFilter,
         },
       });
       setEditor((current) => current ? {
@@ -490,7 +587,7 @@ export default function App() {
         selectedModels: Array.from(new Set([
           ...current.selectedModels,
           ...current.savedModels
-            .filter((model) => categoryOfModel(model) === categoryOfOutput(outputType) && response.models.some((item) => item.modelId === model.modelId))
+            .filter((model) => (catalogFilter === "all" || model.outputType === catalogFilter) && response.models.some((item) => item.modelId === model.modelId && item.outputType === model.outputType))
             .map((model) => model.modelId),
         ])).filter((id) => response.models.some((model) => model.modelId === id)),
         imageCapableModels: Array.from(new Set([
@@ -499,7 +596,7 @@ export default function App() {
         ])),
         validationToken: response.validationToken,
       } : current);
-      setNotice(`连接成功，已加载 ${response.models.length} 个${categoryLabel(categoryOfOutput(outputType))}。`);
+      setNotice(`连接成功，已加载 ${response.models.length} 个${catalogFilter === "all" ? "全部模型" : arenaTypeLabel(catalogFilter)}。`);
       setNoticeSuccess(true);
     } catch (error) {
       setNotice(messageFrom(error));
@@ -519,9 +616,9 @@ export default function App() {
           connectionId: editor.connectionId,
           providerKind: editor.providerKind,
           baseUrl: editor.baseUrl,
-          apiKey: editor.apiKey || undefined,
+          apiKey: editor.apiKey === credentialMask ? undefined : editor.apiKey || undefined,
           modelId: editor.modelId,
-          outputType: editor.providerKind === "openai_compatible" ? editor.outputType : categoryOutputType(editor.modelCategory),
+          outputType: editor.providerKind === "openai_compatible" ? editor.outputType : editor.catalogFilter,
           audioInput: editor.outputType === "audio_to_text" ? audioInput?.dataUrl : undefined,
         },
       });
@@ -563,8 +660,8 @@ export default function App() {
           displayName: editor.displayName,
           providerKind: editor.providerKind,
           baseUrl: editor.baseUrl,
-          apiKey: editor.apiKey || undefined,
-          outputType: editor.providerKind === "openai_compatible" ? editor.outputType : categoryOutputType(editor.modelCategory),
+          apiKey: editor.apiKey === credentialMask ? undefined : editor.apiKey || undefined,
+          outputType: editor.providerKind === "openai_compatible" ? editor.outputType : editor.catalogFilter,
           supportsReferenceImage: modelIds.some((id) => editor.imageCapableModels.includes(id)),
           validationToken: editor.validationToken,
           models: modelIds.map((id) => ({
@@ -694,15 +791,26 @@ export default function App() {
     const file = event.target.files?.[0];
     event.target.value = "";
     if (!file) return;
-    if (file.size > 50 * 1024 * 1024) {
-      setNotice("音频文件不能超过 50 MB。");
+    if (!supportedAudioExtension.test(file.name)) {
+      setNotice("仅支持 mp3、mp4、mpeg、mpga、m4a、wav 或 webm 音频。");
+      setNoticeSuccess(false);
+      return;
+    }
+    if (!file.size) {
+      setNotice("音频文件为空，请重新选择。");
+      setNoticeSuccess(false);
+      return;
+    }
+    if (file.size > 25 * 1024 * 1024) {
+      setNotice("音频文件不能超过 25 MB。");
       setNoticeSuccess(false);
       return;
     }
     const reader = new FileReader();
     reader.onload = () => {
       if (typeof reader.result === "string") {
-        setAudioInput({ name: file.name, dataUrl: reader.result });
+        const dataUrl = reader.result.replace(/^data:[^;,]*/, `data:${audioMimeType(file.name)}`);
+        setAudioInput({ name: file.name, dataUrl });
         setNotice("");
       }
     };
@@ -753,6 +861,17 @@ export default function App() {
     }
   }
 
+  async function downloadAudio(dataUrl: string, modelName: string) {
+    try {
+      const path = await invoke<string>("audio_save", { dataUrl, modelName });
+      setNotice(`音频已保存到 ${path}`);
+      setNoticeSuccess(true);
+    } catch (error) {
+      setNotice(messageFrom(error));
+      setNoticeSuccess(false);
+    }
+  }
+
   return (
     <main className="app-shell">
       <header className="topbar" onMouseDown={startWindowDrag}>
@@ -766,7 +885,7 @@ export default function App() {
             className={activePage === "settings" ? "is-active" : ""}
             aria-current={activePage === "settings" ? "page" : undefined}
             onClick={() => {
-              setSettingsCategory(categoryOfOutput(config.activeArenaType));
+              setSettingsOutputType(config.activeArenaType);
               setActivePage("settings");
             }}
           >模型配置</button>
@@ -776,31 +895,34 @@ export default function App() {
       {activePage === "arena" ? (<div className="arena-page">
       <div className="arena-switch-row">
         <nav className="type-filter arena-type-switch" aria-label="模型类型">
-          {(["text", "image", "audio", "video"] as ModelCategory[]).map((category) => <button
-            type="button"
-            key={category}
-            className={categoryOfOutput(config.activeArenaType) === category ? "is-active" : ""}
-            aria-pressed={categoryOfOutput(config.activeArenaType) === category}
-            onClick={() => void setArenaType(category === "audio" ? "audio" : categoryOutputType(category))}
-            disabled={running}
-          >{categoryLabel(category)}</button>)}
-        </nav>
-        {categoryOfOutput(config.activeArenaType) === "audio" && <nav className="type-filter arena-audio-switch" aria-label="音频任务类型">
-          {(["audio", "audio_to_text"] as OutputType[]).map((outputType) => <button
+          {(["text", "image", "audio", "audio_to_text", "video"] as OutputType[]).map((outputType) => <button
             type="button"
             key={outputType}
             className={config.activeArenaType === outputType ? "is-active" : ""}
             aria-pressed={config.activeArenaType === outputType}
             onClick={() => void setArenaType(outputType)}
             disabled={running}
-          >{outputType === "audio" ? "文本转音频" : "音频转文本"}</button>)}
-        </nav>}
+          >{arenaTypeLabel(outputType)}</button>)}
+        </nav>
       </div>
       <section className="prompt-card" aria-label="提示词输入">
         {config.activeArenaType === "audio_to_text" ? (
           <div className="audio-input-copy">
-            <strong>{audioInput ? audioInput.name : "添加一段音频，让所有语音识别模型同时转写"}</strong>
-            <span>支持 mp3、mp4、mpeg、mpga、m4a、wav、webm，最大 50 MB</span>
+            {audioInput ? (
+              <div className="audio-file-chip" title={audioInput.name}>
+                <span>{audioInput.name}</span>
+                <button
+                  type="button"
+                  aria-label={`移除音频 ${audioInput.name}`}
+                  title="移除音频"
+                  onClick={() => setAudioInput(undefined)}
+                  disabled={running}
+                >×</button>
+              </div>
+            ) : (
+              <strong className="is-placeholder">添加一段音频，让所有语音识别模型同时转写</strong>
+            )}
+            <span>支持 mp3、mp4、mpeg、mpga、m4a、wav、webm，最大 25 MB</span>
           </div>
         ) : (
           <textarea
@@ -845,18 +967,22 @@ export default function App() {
             <SelectMenu
               label="生成音色"
               value={audioVoice}
-              options={['alloy', 'echo', 'fable', 'onyx', 'nova', 'shimmer'].map((voice) => ({ value: voice, label: voice }))}
+              options={[
+                { value: "alloy", label: "alloy（中性）" },
+                { value: "echo", label: "echo（沉稳）" },
+                { value: "fable", label: "fable（叙事）" },
+                { value: "onyx", label: "onyx（深沉）" },
+                { value: "nova", label: "nova（明亮）" },
+                { value: "shimmer", label: "shimmer（轻柔）" },
+              ]}
               onChange={setAudioVoice}
               disabled={running}
             />
           )}
           {config.activeArenaType === "audio_to_text" && <label className={`upload-button ${running ? "is-disabled" : ""}`}>
             ＋ {audioInput ? "更换音频" : "添加音频"}
-            <input type="file" accept="audio/*,.mp4,.mpeg,.mpga,.m4a,.webm" onChange={chooseAudioInput} disabled={running} />
+            <input type="file" accept={audioFileAccept} onChange={chooseAudioInput} disabled={running} />
           </label>}
-          {config.activeArenaType === "audio_to_text" && audioInput && (
-            <button type="button" className="text-button" onClick={() => setAudioInput(undefined)} disabled={running}>移除音频</button>
-          )}
           {config.activeArenaType === "video" && (
             <SelectMenu
               label="视频时长"
@@ -878,7 +1004,7 @@ export default function App() {
         </div>
       </section>
 
-      <section className="result-grid" aria-label="模型输出">
+      <section className={`result-grid ${config.activeArenaType === "audio" ? "is-audio-output" : ""}`} aria-label="模型输出">
         {!loading && enabledModels.map(({ connection, model }) => {
           const result = results[model.id];
           const status = result?.status ?? (running ? "running" : "idle");
@@ -909,16 +1035,25 @@ export default function App() {
               </div>
               <footer title={`连接：${connection.displayName}`}>
                 <span>{result && result.status !== "running" ? `${(result.elapsedMs / 1000).toFixed(1)} 秒` : "-- 秒"}</span>
-                <span>输入 {metric(result?.usage?.inputTokens)}</span>
-                <span>输出 {metric(result?.usage?.outputTokens)}</span>
-                <span>总计 {metric(result?.usage?.totalTokens)}</span>
+                {config.activeArenaType !== "audio" && config.activeArenaType !== "audio_to_text" && <>
+                  <span>输入 {metric(result?.usage?.inputTokens)}</span>
+                  <span>输出 {metric(result?.usage?.outputTokens)}</span>
+                  <span>总计 {metric(result?.usage?.totalTokens)}</span>
+                </>}
+                {result?.outputAudio && <button
+                  type="button"
+                  className="download-action"
+                  aria-label={`下载 ${model.displayName} 音频`}
+                  title="下载音频"
+                  onClick={() => downloadAudio(result.outputAudio!, model.displayName)}
+                ><DownloadIcon /></button>}
               </footer>
             </article>
           );
         })}
         {!loading && !enabledModels.length && (
           <button className="model-card add-card" onClick={() => {
-            setSettingsCategory(categoryOfOutput(config.activeArenaType));
+            setSettingsOutputType(config.activeArenaType);
             setActivePage("settings");
           }}>
             <span className="add-icon">＋</span>
@@ -933,14 +1068,14 @@ export default function App() {
               {!editor && <div className="settings-overview">
                 <div className="model-pool-filters">
                   <div className="type-filter" role="group" aria-label="模型池类型">
-                    {(["text", "image", "audio", "video"] as ModelCategory[]).map((category) => (
+                    {settingsGroups.map(({ outputType, label }) => (
                       <button
                         type="button"
-                        key={category}
-                        className={settingsCategory === category ? "is-active" : ""}
-                        aria-pressed={settingsCategory === category}
-                        onClick={() => setSettingsCategory(category)}
-                      >{categoryLabel(category)}</button>
+                        key={outputType}
+                        className={settingsOutputType === outputType ? "is-active" : ""}
+                        aria-pressed={settingsOutputType === outputType}
+                        onClick={() => setSettingsOutputType(outputType)}
+                      >{label}</button>
                     ))}
                   </div>
                   {!!availableProviders.length && <div className="source-filters" role="group" aria-label="来源筛选">
@@ -956,7 +1091,7 @@ export default function App() {
                   </div>}
                 </div>
 
-                <section className="model-pool" aria-label={`${categoryLabel(settingsCategory)}模型池`}>
+                <section className="model-pool" aria-label={`${arenaTypeLabel(settingsOutputType)}模型池`}>
                   {settingsModelGroups.map((group) => <section className="model-category" key={group.outputType}>
                       <header className="model-category-header">
                         <div><strong>{group.label}</strong><span>{group.models.length} 个</span></div>
@@ -1057,9 +1192,15 @@ export default function App() {
                       <input
                         value={editor.apiKey}
                         onChange={(event) => updateEditor("apiKey", event.target.value)}
+                        onFocus={() => {
+                          if (editor.apiKey === credentialMask) updateEditor("apiKey", "");
+                        }}
+                        onBlur={() => {
+                          if (editor.hasCredential && !editor.apiKey) updateEditor("apiKey", credentialMask);
+                        }}
                         type="password"
                         autoComplete="off"
-                        placeholder={editor.hasCredential ? "正在读取已保存的 API Key…" : "仅保存到 macOS 钥匙串"}
+                        placeholder={editor.hasCredential ? "已保存在本软件；点击可替换" : "仅保存在本软件中"}
                         required={!editor.connectionId}
                       />
                     </label>
@@ -1100,7 +1241,7 @@ export default function App() {
                         </div>
                         {editor.outputType === "audio_to_text" && <label className="upload-button editor-audio-upload">
                           ＋ {audioInput ? `测试音频：${audioInput.name}` : "添加测试音频"}
-                          <input type="file" accept="audio/*,.mp4,.mpeg,.mpga,.m4a,.webm" onChange={chooseAudioInput} />
+                          <input type="file" accept={audioFileAccept} onChange={chooseAudioInput} />
                         </label>}
                       </>}
                     </section>
@@ -1117,14 +1258,15 @@ export default function App() {
                       {editor.connected ? (
                         <>
                           <div className="type-filter" role="group" aria-label="模型目录筛选">
-                            {(["text", "image", "audio", "video"] as ModelCategory[]).map((category) => (
+                            {([{ outputType: "all" as const, label: "全部" }, ...settingsGroups]).map(({ outputType, label }) => (
                               <button
                                 type="button"
-                                key={category}
-                                className={editor.modelCategory === category ? "is-active" : ""}
-                                onClick={() => void selectEditorCategory(category)}
+                                key={outputType}
+                                aria-label={outputType === "all" ? "全部模型" : undefined}
+                                className={editor.catalogFilter === outputType ? "is-active" : ""}
+                                onClick={() => void selectEditorCatalogFilter(outputType)}
                                 disabled={busy}
-                              >{categoryLabel(category)}</button>
+                              >{label}</button>
                             ))}
                           </div>
                           {busy && <p className="provider-hint" role="status">正在加载当前分类模型…</p>}
@@ -1135,27 +1277,73 @@ export default function App() {
                       {!!editor.catalog.length && (
                         <div className="catalog-block">
                           <div className="catalog-heading">
-                            <strong>选择{categoryLabel(editor.modelCategory)}</strong>
+                            <strong>选择{editor.catalogFilter === "all" ? "全部模型" : arenaTypeLabel(editor.outputType)}</strong>
                             <span>已选 {editor.selectedModels.length} 个</span>
                           </div>
-                          <input
-                            className="catalog-search"
-                            value={editor.catalogQuery}
-                            onChange={(event) => setEditor((current) => current ? { ...current, catalogQuery: event.target.value } : current)}
-                            placeholder="搜索模型 ID"
-                            aria-label="搜索模型"
-                          />
+                          <div className="catalog-controls">
+                            <input
+                              className="catalog-search"
+                              value={editor.catalogQuery}
+                              onChange={(event) => setEditor((current) => current ? { ...current, catalogQuery: event.target.value } : current)}
+                              placeholder="搜索模型 ID"
+                              aria-label="搜索模型"
+                            />
+                            {editor.catalogFilter === "text" && <div className="catalog-size-filter" role="group" aria-label="模型参数量筛选">
+                              <input
+                                type="checkbox"
+                                aria-label="启用参数量筛选"
+                                checked={editor.parameterLimitEnabled}
+                                onChange={(event) => setEditor((current) => current ? { ...current, parameterLimitEnabled: event.target.checked } : current)}
+                              />
+                              <input
+                                className="catalog-size-input"
+                                type="number"
+                                min="0.1"
+                                step="0.1"
+                                inputMode="decimal"
+                                aria-label="参数量上限"
+                                value={editor.maxParameterBillions}
+                                onChange={(event) => setEditor((current) => current ? { ...current, maxParameterBillions: event.target.value } : current)}
+                                onBlur={() => setEditor((current) => current && (!Number.isFinite(Number(current.maxParameterBillions)) || Number(current.maxParameterBillions) <= 0)
+                                  ? { ...current, maxParameterBillions: "14" }
+                                  : current)}
+                              />
+                              <span>B 以下</span>
+                            </div>}
+                            {editor.catalogFilter === "text" && <div className="catalog-reasoning-filter" role="group" aria-label="推理能力筛选">
+                              <span>推理能力</span>
+                              {([
+                                ["all", "全部"],
+                                ["reasoning", "推理模型"],
+                                ["non_reasoning", "非推理模型"],
+                              ] as Array<[ReasoningFilter, string]>).map(([value, label]) => <button
+                                type="button"
+                                key={value}
+                                aria-pressed={editor.reasoningFilter === value}
+                                className={editor.reasoningFilter === value ? "is-active" : ""}
+                                onClick={() => setEditor((current) => current ? { ...current, reasoningFilter: value } : current)}
+                              >{label}</button>)}
+                            </div>}
+                          </div>
                           <div className="catalog-list">
-                            {(editor.modelCategory === "audio"
-                              ? (["audio", "audio_to_text"] as OutputType[])
+                            {(editor.catalogFilter === "all"
+                              ? settingsGroups.map(({ outputType }) => outputType)
                               : [editor.outputType]
                             ).map((outputType) => {
                               const models = editor.catalog.filter((model) =>
                                 (model.outputType ?? editor.outputType) === outputType
+                                && (!editor.parameterLimitEnabled
+                                  || editor.modelCategory !== "text"
+                                  || isModelAtMostBillions(model.modelId, Number(editor.maxParameterBillions)))
+                                && (editor.reasoningFilter === "all"
+                                  || (editor.reasoningFilter === "reasoning") === isReasoningModel(model.modelId))
                                 && model.modelId.toLowerCase().includes(editor.catalogQuery.trim().toLowerCase()));
-                              if (!models.length) return null;
+                              if (!models.length) return editor.modelCategory === "text"
+                                && (editor.parameterLimitEnabled || editor.reasoningFilter !== "all")
+                                ? <p className="catalog-empty" key={outputType}>没有符合当前筛选条件的模型。</p>
+                                : null;
                               return <section className="catalog-section" key={outputType}>
-                                {editor.modelCategory === "audio" && <h4>{capabilityLabels(outputType, false)[0]} · {models.length} 个</h4>}
+                                {editor.catalogFilter === "all" && <h4>{arenaTypeLabel(outputType)} · {models.length} 个</h4>}
                                 <div className="catalog-section-grid">
                                   {models.map((model) => (
                                     <div key={`${outputType}:${model.modelId}`} className="catalog-item">
@@ -1167,8 +1355,8 @@ export default function App() {
                                         />
                                         <span title={model.modelId}>{model.modelId}</span>
                                       </label>
-                                      <span className="catalog-capability" title="由模型平台返回的能力信息">
-                                        {capabilityLabels(outputType, model.supportsReferenceImage).map((label) => <em key={label}>{label}</em>)}
+                                      <span className="catalog-capability" title="根据模型名称和平台能力信息生成">
+                                        {modelCapabilityLabels({ ...model, outputType }).map((label) => <em key={label}>{label}</em>)}
                                       </span>
                                     </div>
                                   ))}
