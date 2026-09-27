@@ -8,10 +8,10 @@
 
 [![平台](https://img.shields.io/badge/%E5%B9%B3%E5%8F%B0-Apple_Silicon_Mac-4F8FF7?style=flat-square&labelColor=111827&logo=apple&logoColor=white)](#requirements)
 [![系统](https://img.shields.io/badge/%E7%B3%BB%E7%BB%9F-macOS_14%2B-8B5CF6?style=flat-square&labelColor=111827)](#requirements)
-[![版本](https://img.shields.io/badge/%E7%89%88%E6%9C%AC-v1.0.1-22C55E?style=flat-square&labelColor=111827)](https://github.com/yuanhao667/model-battle/releases/tag/v1.0.1)
-[![安装包](https://img.shields.io/badge/%E5%AE%89%E8%A3%85%E5%8C%85-DMG-F59E0B?style=flat-square&labelColor=111827)](https://github.com/yuanhao667/model-battle/releases/download/v1.0.1/Model.Battle_1.0.1_aarch64.dmg)
+[![版本](https://img.shields.io/badge/%E7%89%88%E6%9C%AC-v1.0.2-22C55E?style=flat-square&labelColor=111827)](https://github.com/yuanhao667/model-battle/releases/tag/v1.0.2)
+[![安装包](https://img.shields.io/badge/%E5%AE%89%E8%A3%85%E5%8C%85-DMG-F59E0B?style=flat-square&labelColor=111827)](https://github.com/yuanhao667/model-battle/releases/download/v1.0.2/Model.Battle_1.0.2_aarch64.dmg)
 
-[![立即下载](https://img.shields.io/badge/%E7%AB%8B%E5%8D%B3%E4%B8%8B%E8%BD%BD-Model_Battle_DMG-F54E00?style=for-the-badge&labelColor=111827&logo=apple&logoColor=white)](https://github.com/yuanhao667/model-battle/releases/download/v1.0.1/Model.Battle_1.0.1_aarch64.dmg)
+[![立即下载](https://img.shields.io/badge/%E7%AB%8B%E5%8D%B3%E4%B8%8B%E8%BD%BD-Model_Battle_DMG-F54E00?style=for-the-badge&labelColor=111827&logo=apple&logoColor=white)](https://github.com/yuanhao667/model-battle/releases/download/v1.0.2/Model.Battle_1.0.2_aarch64.dmg)
 
 [产品简介](#intro) · [核心能力](#features) · [使用前准备](#requirements) · [下载安装](#install) · [开始使用](#usage) · [数据与隐私](#privacy)
 
@@ -47,7 +47,7 @@ Model Battle 是一款面向 Apple Silicon Mac 的本地多模型对比工具。
 <a id="install"></a>
 ## 下载安装
 
-1. 下载最新的 [Model Battle v1.0.1 DMG 安装包](https://github.com/yuanhao667/model-battle/releases/download/v1.0.1/Model.Battle_1.0.1_aarch64.dmg)。
+1. 下载最新的 [Model Battle v1.0.2 DMG 安装包](https://github.com/yuanhao667/model-battle/releases/download/v1.0.2/Model.Battle_1.0.2_aarch64.dmg)。
 2. 打开 DMG，将 `Model Battle.app` 拖入“应用程序”文件夹。
 3. 从“应用程序”中打开 Model Battle。
 
