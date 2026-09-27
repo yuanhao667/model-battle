@@ -23,11 +23,37 @@ describe("App", () => {
     });
   });
 
-  it("opens the homepage without requesting keychain access", async () => {
+  it("opens the homepage without requesting credential access", async () => {
     render(<App />);
 
     expect(await screen.findByRole("button", { name: "模型 Battle" })).toHaveAttribute("aria-current", "page");
     expect(invoke).not.toHaveBeenCalledWith("keychain_access_prepare");
+  });
+
+  it("switches empty arena types and opens the matching settings category", async () => {
+    let activeArenaType = { value: "text" };
+    invoke.mockImplementation((command: string, args?: { outputType?: string }) => {
+      if (command === "settings_get") {
+        return Promise.resolve({ ...emptyConfig, activeArenaType: activeArenaType.value });
+      }
+      if (command === "arena_type_set") {
+        activeArenaType.value = args?.outputType ?? "text";
+        return Promise.resolve({ ...emptyConfig, activeArenaType: activeArenaType.value });
+      }
+      return Promise.resolve({});
+    });
+    const user = userEvent.setup();
+    render(<App />);
+
+    await user.click(await screen.findByRole("button", { name: "视频生成模型" }));
+    await waitFor(() => expect(screen.getByRole("button", { name: "视频生成模型" })).toHaveAttribute("aria-pressed", "true"));
+    const addCard = screen.getByRole("button", { name: /添加模型连接/ });
+    expect(addCard).toHaveClass("add-card");
+    await user.click(addCard);
+
+    expect(screen.getByRole("button", { name: "模型配置" })).toHaveAttribute("aria-current", "page");
+    expect(screen.getByRole("button", { name: "视频生成模型" })).toHaveAttribute("aria-pressed", "true");
+    expect(screen.getByLabelText("视频生成模型模型池")).toBeInTheDocument();
   });
 
   it("keeps every connection path on one settings page", async () => {
@@ -91,7 +117,110 @@ describe("App", () => {
     });
   });
 
-  it("keeps model switch and connection edit as independent actions", async () => {
+  it("filters text model candidates by an editable parameter limit without changing their category", async () => {
+    invoke.mockImplementation((command: string) => {
+      if (command === "settings_get") return Promise.resolve(emptyConfig);
+      if (command === "provider_models") {
+        return Promise.resolve({
+          validationToken: "validated",
+          models: [
+            { modelId: "Qwen/Qwen2.5-7B-Instruct", outputType: "text", supportsReferenceImage: false },
+            { modelId: "Qwen/Qwen2.5-14B-Instruct", outputType: "text", supportsReferenceImage: false },
+            { modelId: "Qwen/Qwen3-30B-A3B", outputType: "text", supportsReferenceImage: false },
+            { modelId: "mistralai/Mixtral-8x7B-Instruct", outputType: "text", supportsReferenceImage: false },
+            { modelId: "deepseek-ai/DeepSeek-R1-Distill-Qwen-1.5B", outputType: "text", supportsReferenceImage: false },
+            { modelId: "gpt-4o-mini", outputType: "text", supportsReferenceImage: false },
+          ],
+        });
+      }
+      if (command === "connection_save") return Promise.resolve({});
+      return Promise.resolve({});
+    });
+    const user = userEvent.setup();
+    render(<App />);
+    await user.click(await screen.findByRole("button", { name: /添加模型连接/ }));
+    await user.click(screen.getByRole("button", { name: /AIHubMix/ }));
+    await user.type(screen.getByLabelText(/API Key/), "test-key");
+    await user.click(screen.getByRole("button", { name: "验证连接并加载模型" }));
+
+    expect(await screen.findByLabelText("Qwen/Qwen3-30B-A3B")).toBeInTheDocument();
+    expect(screen.getByLabelText("gpt-4o-mini")).toBeInTheDocument();
+    expect(screen.getByText("7B")).toBeInTheDocument();
+    expect(screen.getByText("14B")).toBeInTheDocument();
+
+    await user.click(screen.getByRole("button", { name: "推理模型" }));
+    expect(screen.getByLabelText("deepseek-ai/DeepSeek-R1-Distill-Qwen-1.5B")).toBeInTheDocument();
+    expect(screen.queryByLabelText("Qwen/Qwen2.5-7B-Instruct")).not.toBeInTheDocument();
+    await user.click(screen.getByRole("button", { name: "非推理模型" }));
+    expect(screen.queryByLabelText("deepseek-ai/DeepSeek-R1-Distill-Qwen-1.5B")).not.toBeInTheDocument();
+    expect(screen.getByLabelText("Qwen/Qwen2.5-7B-Instruct")).toBeInTheDocument();
+    await user.click(screen.getByRole("button", { name: "全部" }));
+
+    await user.click(screen.getByRole("checkbox", { name: "启用参数量筛选" }));
+
+    expect(screen.getByLabelText("Qwen/Qwen2.5-7B-Instruct")).toBeInTheDocument();
+    expect(screen.getByLabelText("Qwen/Qwen2.5-14B-Instruct")).toBeInTheDocument();
+    expect(screen.queryByLabelText("Qwen/Qwen3-30B-A3B")).not.toBeInTheDocument();
+    expect(screen.queryByLabelText("mistralai/Mixtral-8x7B-Instruct")).not.toBeInTheDocument();
+    expect(screen.queryByLabelText("gpt-4o-mini")).not.toBeInTheDocument();
+
+    const parameterLimit = screen.getByRole("spinbutton", { name: "参数量上限" });
+    expect(parameterLimit).toHaveValue(14);
+    await user.clear(parameterLimit);
+    await user.type(parameterLimit, "7");
+    expect(screen.getByLabelText("Qwen/Qwen2.5-7B-Instruct")).toBeInTheDocument();
+    expect(screen.queryByLabelText("Qwen/Qwen2.5-14B-Instruct")).not.toBeInTheDocument();
+
+    await user.click(screen.getByLabelText("Qwen/Qwen2.5-7B-Instruct"));
+    await user.click(screen.getByRole("button", { name: "保存模型配置" }));
+    expect(invoke).toHaveBeenCalledWith("connection_save", {
+      input: expect.objectContaining({
+        outputType: "text",
+        models: [expect.objectContaining({ modelId: "Qwen/Qwen2.5-7B-Instruct", outputType: "text" })],
+      }),
+    });
+  });
+
+  it("saves mixed model types selected from the all catalog", async () => {
+    invoke.mockImplementation((command: string, args?: { input?: { outputType?: string } }) => {
+      if (command === "settings_get") return Promise.resolve(emptyConfig);
+      if (command === "provider_models") {
+        const outputType = args?.input?.outputType ?? "text";
+        return Promise.resolve({
+          validationToken: `validated-${outputType}`,
+          models: outputType === "all" ? [
+            { modelId: "chat-3B", outputType: "text", supportsReferenceImage: false },
+            { modelId: "image-2B", outputType: "image", supportsReferenceImage: true },
+          ] : [{ modelId: "chat-3B", outputType: "text", supportsReferenceImage: false }],
+        });
+      }
+      if (command === "connection_save") return Promise.resolve({});
+      return Promise.resolve({});
+    });
+    const user = userEvent.setup();
+    render(<App />);
+    await user.click(await screen.findByRole("button", { name: /添加模型连接/ }));
+    await user.click(screen.getByRole("button", { name: /硅基流动/ }));
+    await user.type(screen.getByLabelText(/API Key/), "test-key");
+    await user.click(screen.getByRole("button", { name: "验证连接并加载模型" }));
+    await user.click(screen.getByRole("button", { name: "全部模型" }));
+    await user.click(await screen.findByLabelText("chat-3B"));
+    await user.click(screen.getByLabelText("image-2B"));
+    await user.click(screen.getByRole("button", { name: "保存模型配置" }));
+
+    expect(invoke).toHaveBeenCalledWith("connection_save", {
+      input: expect.objectContaining({
+        outputType: "all",
+        validationToken: "validated-all",
+        models: [
+          expect.objectContaining({ modelId: "chat-3B", outputType: "text" }),
+          expect.objectContaining({ modelId: "image-2B", outputType: "image" }),
+        ],
+      }),
+    });
+  });
+
+  it("keeps saved credentials out of the connection editor", async () => {
     invoke.mockImplementation((command: string) => {
       if (command === "settings_get") {
         return Promise.resolve({
@@ -124,7 +253,6 @@ describe("App", () => {
           }],
         });
       }
-      if (command === "connection_key_get") return Promise.resolve("saved-secret-key");
       return Promise.resolve({});
     });
     const user = userEvent.setup();
@@ -134,8 +262,14 @@ describe("App", () => {
     await user.click(await screen.findByRole("button", { name: "编辑AIHubMix" }));
     expect(screen.getByRole("heading", { name: "编辑连接" })).toBeInTheDocument();
     expect(screen.getByLabelText(/API Key/)).toHaveAttribute("type", "password");
-    await waitFor(() => expect(screen.getByLabelText(/API Key/)).toHaveValue("saved-secret-key"));
-    expect(invoke).toHaveBeenCalledWith("connection_key_get", { connectionId: "connection-1" });
+    const apiKeyInput = screen.getByLabelText(/API Key/);
+    expect(apiKeyInput).toHaveValue("••••••••");
+    expect(apiKeyInput).toHaveAttribute("placeholder", "已保存在本软件；点击可替换");
+    await user.click(apiKeyInput);
+    expect(apiKeyInput).toHaveValue("");
+    await user.tab();
+    expect(apiKeyInput).toHaveValue("••••••••");
+    expect(invoke).not.toHaveBeenCalledWith("connection_key_get", expect.anything());
     expect(screen.queryByText(/AIHubMix · 1 个模型/)).not.toBeInTheDocument();
     expect(screen.queryByRole("button", { name: "保存模型配置" })).not.toBeInTheDocument();
     expect(invoke).not.toHaveBeenCalledWith("model_set_enabled", expect.anything());
@@ -319,10 +453,19 @@ describe("App", () => {
         const outputType = args?.input?.outputType ?? "text";
         return Promise.resolve({
           validationToken: "validated",
-          models: outputType === "audio" ? [
-            { modelId: "tts-1", outputType: "audio", supportsReferenceImage: false },
-            { modelId: "whisper-1", outputType: "audio_to_text", supportsReferenceImage: false },
-          ] : [{ modelId: "gpt-image-1", outputType, supportsReferenceImage: true }],
+          models: outputType === "all"
+            ? [
+              { modelId: "text-gen-3B", outputType: "text", supportsReferenceImage: false },
+              { modelId: "image-gen-2B", outputType: "image", supportsReferenceImage: true },
+              { modelId: "tts-1", outputType: "audio", supportsReferenceImage: false },
+              { modelId: "whisper-1", outputType: "audio_to_text", supportsReferenceImage: false },
+              { modelId: "video-gen-5B", outputType: "video", supportsReferenceImage: true },
+            ]
+            : outputType === "audio"
+            ? [{ modelId: "tts-1", outputType: "audio", supportsReferenceImage: false }]
+            : outputType === "audio_to_text"
+              ? [{ modelId: "whisper-1", outputType: "audio_to_text", supportsReferenceImage: false }]
+              : [{ modelId: "gpt-image-1", outputType, supportsReferenceImage: true }],
         });
       }
       return Promise.resolve({});
@@ -334,16 +477,33 @@ describe("App", () => {
     expect(screen.queryByRole("group", { name: "模型目录筛选" })).not.toBeInTheDocument();
     await user.type(screen.getByLabelText(/API Key/), "test-key");
     await user.click(screen.getByRole("button", { name: "验证连接并加载模型" }));
+    expect(screen.getByRole("button", { name: "全部模型" })).toBeEnabled();
     expect(screen.getByRole("button", { name: "文本生成模型" })).toBeEnabled();
-    expect(screen.getByRole("button", { name: "音频模型" })).toBeEnabled();
+    expect(screen.getByRole("button", { name: "文本转音频" })).toBeEnabled();
+    expect(screen.getByRole("button", { name: "音频转文本" })).toBeEnabled();
     expect(screen.getByRole("button", { name: "视频生成模型" })).toBeEnabled();
     expect(screen.queryByRole("button", { name: "加载当前分类模型" })).not.toBeInTheDocument();
-    await user.click(screen.getByRole("button", { name: "音频模型" }));
+    await user.click(screen.getByRole("button", { name: "全部模型" }));
+    expect(invoke).toHaveBeenCalledWith("provider_models", {
+      input: expect.objectContaining({ outputType: "all" }),
+    });
+    expect(await screen.findByText("图片生成模型 · 1 个")).toBeInTheDocument();
+    expect(screen.getByText("视频生成模型 · 1 个")).toBeInTheDocument();
+    expect(screen.getByText("2B")).toBeInTheDocument();
+    expect(screen.getByText("5B")).toBeInTheDocument();
+    await user.click(screen.getByRole("button", { name: "文本转音频" }));
     expect(invoke).toHaveBeenCalledWith("provider_models", {
       input: expect.objectContaining({ outputType: "audio" }),
     });
-    expect(screen.getAllByText("文本转音频").length).toBeGreaterThan(0);
-    expect(screen.getAllByText("音频转文本").length).toBeGreaterThan(0);
+    expect(await screen.findByLabelText("tts-1")).toBeInTheDocument();
+    expect(screen.queryByLabelText("whisper-1")).not.toBeInTheDocument();
+    await waitFor(() => expect(screen.getByRole("button", { name: "音频转文本" })).toBeEnabled());
+    await user.click(screen.getByRole("button", { name: "音频转文本" }));
+    expect(invoke).toHaveBeenCalledWith("provider_models", {
+      input: expect.objectContaining({ outputType: "audio_to_text" }),
+    });
+    expect(await screen.findByLabelText("whisper-1")).toBeInTheDocument();
+    expect(screen.queryByLabelText("tts-1")).not.toBeInTheDocument();
     await waitFor(() => expect(screen.getByRole("button", { name: "视频生成模型" })).toBeEnabled());
     await user.click(screen.getByRole("button", { name: "视频生成模型" }));
     expect(invoke).toHaveBeenCalledWith("provider_models", {
@@ -372,7 +532,8 @@ describe("App", () => {
     expect(screen.queryByRole("group", { name: "模型目录筛选" })).not.toBeInTheDocument();
     await user.type(screen.getByLabelText(/API Key/), "test-key");
     await user.click(screen.getByRole("button", { name: "验证连接并加载模型" }));
-    expect(screen.getByRole("button", { name: "音频模型" })).toBeEnabled();
+    expect(screen.getByRole("button", { name: "文本转音频" })).toBeEnabled();
+    expect(screen.getByRole("button", { name: "音频转文本" })).toBeEnabled();
     expect(screen.getByRole("button", { name: "视频生成模型" })).toBeEnabled();
     await user.click(screen.getByRole("button", { name: "取消" }));
 
@@ -408,8 +569,19 @@ describe("App", () => {
     const user = userEvent.setup();
     render(<App />);
 
-    expect(await screen.findByLabelText("生成音色")).toBeInTheDocument();
+    expect(await screen.findByRole("button", { name: "文本转音频" })).toHaveAttribute("aria-pressed", "true");
+    expect(screen.getByRole("button", { name: "音频转文本" })).toHaveAttribute("aria-pressed", "false");
+    expect(screen.queryByRole("button", { name: "音频模型" })).not.toBeInTheDocument();
+    expect(screen.queryByRole("group", { name: "音频任务类型" })).not.toBeInTheDocument();
+    const voiceSelect = await screen.findByLabelText("生成音色");
+    expect(voiceSelect).toBeInTheDocument();
+    await user.click(voiceSelect);
+    expect(screen.getByRole("option", { name: "alloy（中性）" })).toHaveAttribute("aria-selected", "true");
+    expect(screen.getByRole("option", { name: "shimmer（轻柔）" })).toBeInTheDocument();
     expect(screen.getByRole("button", { name: "生成全部音频" })).toBeInTheDocument();
+    expect(screen.queryByText("输入 --")).not.toBeInTheDocument();
+    expect(screen.queryByText("输出 --")).not.toBeInTheDocument();
+    expect(screen.queryByText("总计 --")).not.toBeInTheDocument();
     expect(screen.queryByLabelText(/添加图片/)).not.toBeInTheDocument();
     await user.click(screen.getByRole("button", { name: "模型配置" }));
     expect(screen.getAllByText("文本转音频").length).toBeGreaterThan(0);
@@ -435,13 +607,43 @@ describe("App", () => {
     const user = userEvent.setup();
     render(<App />);
 
+    expect(await screen.findByText("添加一段音频，让所有语音识别模型同时转写")).toHaveClass("is-placeholder");
     const upload = await screen.findByLabelText(/添加音频/);
     expect(screen.getByRole("button", { name: "转写全部音频" })).toBeDisabled();
-    await user.upload(upload, new File(["audio"], "sample.mp3", { type: "audio/mpeg" }));
+    await user.upload(upload, new File(["audio"], "sample.mpga"));
+    expect(screen.getByText("sample.mpga")).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "移除音频 sample.mpga" })).toBeInTheDocument();
+    expect(screen.queryByText("移除音频")).not.toBeInTheDocument();
     await user.click(screen.getByRole("button", { name: "转写全部音频" }));
     expect(invoke).toHaveBeenCalledWith("text_run_start", expect.objectContaining({
       input: expect.objectContaining({ audioInput: expect.stringMatching(/^data:audio\/mpeg;base64,/) }),
     }));
+  });
+
+  it("rejects unsupported audio files before a transcription run", async () => {
+    invoke.mockImplementation((command: string) => {
+      if (command === "settings_get") return Promise.resolve({
+        schemaVersion: 1,
+        activeArenaType: "audio_to_text",
+        connections: [{
+          id: "connection-1",
+          displayName: "AIHubMix",
+          providerKind: "aihubmix",
+          baseUrl: "https://aihubmix.com/v1",
+          hasCredential: true,
+          models: [{ id: "stt-1", modelId: "whisper-1", displayName: "whisper-1", outputType: "audio_to_text", supportsReferenceImage: false, enabled: true }],
+        }],
+      });
+      return Promise.resolve({});
+    });
+    const user = userEvent.setup({ applyAccept: false });
+    render(<App />);
+
+    await user.upload(await screen.findByLabelText(/添加音频/), new File(["audio"], "sample.ogg", { type: "audio/ogg" }));
+
+    expect(screen.getByRole("alert")).toHaveTextContent("仅支持 mp3、mp4、mpeg、mpga、m4a、wav 或 webm 音频");
+    expect(screen.getByRole("button", { name: "转写全部音频" })).toBeDisabled();
+    expect(invoke).not.toHaveBeenCalledWith("text_run_start", expect.anything());
   });
 
   it("shows video generation controls for a video arena", async () => {
@@ -493,5 +695,90 @@ describe("App", () => {
     expect(invoke).not.toHaveBeenCalledWith("text_run_start", expect.anything());
     await user.keyboard("{Enter}");
     await waitFor(() => expect(invoke).toHaveBeenCalledWith("text_run_start", expect.anything()));
+  });
+
+  it("marks the system prompt as unset then set, and saves it for the current arena type", async () => {
+    invoke.mockImplementation((command: string, args?: { systemPrompt?: string; outputType?: string }) => {
+      if (command === "settings_get") return Promise.resolve(emptyConfig);
+      if (command === "system_prompt_set") {
+        const value = args?.systemPrompt?.trim();
+        return Promise.resolve({
+          ...emptyConfig,
+          systemPrompts: value ? { [args?.outputType ?? "text"]: value } : {},
+        });
+      }
+      return Promise.resolve({});
+    });
+    const user = userEvent.setup();
+    render(<App />);
+
+    const status = await screen.findByRole("button", { name: /系统提示词/ });
+    expect(status.querySelector(".system-prompt-dot")).not.toHaveClass("is-set");
+
+    await user.click(status);
+    await user.type(screen.getByPlaceholderText(/你是严谨的技术编辑/), "只输出结论");
+    await user.click(screen.getByRole("button", { name: "保存" }));
+
+    await waitFor(() => expect(invoke).toHaveBeenCalledWith("system_prompt_set", {
+      outputType: "text",
+      systemPrompt: "只输出结论",
+    }));
+    await waitFor(() => expect(document.querySelector(".system-prompt-dot")).toHaveClass("is-set"));
+  });
+
+  it("keeps the system prompt control on every arena type and reads its own value", async () => {
+    let activeArenaType = { value: "text" };
+    invoke.mockImplementation((command: string, args?: { outputType?: string }) => {
+      if (command === "settings_get") {
+        return Promise.resolve({ ...emptyConfig, activeArenaType: activeArenaType.value, systemPrompts: { text: "只输出结论" } });
+      }
+      if (command === "arena_type_set") {
+        activeArenaType.value = args?.outputType ?? "text";
+        return Promise.resolve({ ...emptyConfig, activeArenaType: activeArenaType.value, systemPrompts: { text: "只输出结论" } });
+      }
+      return Promise.resolve({});
+    });
+    const user = userEvent.setup();
+    render(<App />);
+
+    // 文本模式：显示已设置
+    const textStatus = await screen.findByRole("button", { name: /系统提示词/ });
+    expect(textStatus.querySelector(".system-prompt-dot")).toHaveClass("is-set");
+
+    // 切到图片生成：控件仍在，且因为这类没设过而回到未设置
+    await user.click(screen.getByRole("button", { name: "图片生成模型" }));
+    await waitFor(() => expect(screen.getByRole("button", { name: "图片生成模型" })).toHaveAttribute("aria-pressed", "true"));
+    const imageStatus = screen.getByRole("button", { name: /系统提示词/ });
+    expect(imageStatus.querySelector(".system-prompt-dot")).not.toHaveClass("is-set");
+
+    await user.click(imageStatus);
+    expect(screen.getByText(/会拼接在提示词前面/)).toBeInTheDocument();
+    expect(screen.getByPlaceholderText(/你是严谨的技术编辑/)).toHaveValue("");
+  });
+
+  it("hides the source filter when only one source is configured", async () => {
+    invoke.mockImplementation((command: string) => {
+      if (command === "settings_get") return Promise.resolve({
+        schemaVersion: 1,
+        activeArenaType: "text",
+        connections: [{
+          id: "siliconflow",
+          displayName: "硅基流动",
+          providerKind: "siliconflow",
+          baseUrl: "https://api.siliconflow.cn/v1",
+          hasCredential: true,
+          models: [{ id: "deepseek", modelId: "deepseek-v3", displayName: "deepseek-v3", outputType: "text", supportsReferenceImage: false, enabled: true }],
+        }],
+      });
+      return Promise.resolve({});
+    });
+    const user = userEvent.setup();
+    render(<App />);
+    await user.click(await screen.findByRole("button", { name: "模型配置" }));
+
+    expect(screen.queryByRole("group", { name: "来源筛选" })).not.toBeInTheDocument();
+    expect(screen.queryByRole("checkbox", { name: /筛选来源/ })).not.toBeInTheDocument();
+    // 筛选行藏起来时，唯一来源的模型依旧要全部列出
+    expect(screen.getByText("deepseek-v3")).toBeInTheDocument();
   });
 });
