@@ -237,6 +237,12 @@ h1, h2, h3 { font-weight: 400; }
 .editor-audio-upload { width: fit-content; }
 .connection-editor label { display: grid; gap: 7px; }
 .connection-editor label > span { color: var(--muted); font-size: 11px; font-weight: 500; }
+.credential-field { display: grid; gap: 7px; }
+.credential-label { display: flex; align-items: center; justify-content: space-between; gap: 8px; }
+.credential-label label { color: var(--muted); font-size: 11px; font-weight: 500; }
+.credential-replace { padding: 0; border: 0; color: var(--muted); background: transparent; font-size: 11px; font-weight: 500; }
+.credential-replace:hover { color: var(--ember); text-decoration: underline; }
+.connection-editor input[readonly] { cursor: default; }
 .connection-editor label b { color: var(--ember); }
 .connection-editor input:not([type="checkbox"]) { width: 100%; height: 38px; padding: 0 11px; border: 1px solid var(--border); border-radius: 4px; outline: 0; color: var(--accent); background: var(--input-surface); }
 .connection-editor input:not([type="checkbox"]):focus { border-color: var(--accent); box-shadow: 0 0 0 2px var(--elevated); }

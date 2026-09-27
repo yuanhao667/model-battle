@@ -265,11 +265,21 @@ describe("App", () => {
     expect(screen.getByLabelText(/API Key/)).toHaveAttribute("type", "password");
     const apiKeyInput = screen.getByLabelText(/API Key/);
     expect(apiKeyInput).toHaveValue("••••••••");
-    expect(apiKeyInput).toHaveAttribute("placeholder", "已保存在本软件；点击可替换");
+    expect(apiKeyInput).toHaveAttribute("readonly");
+    expect(apiKeyInput).toHaveAttribute("placeholder", "已保存在本软件");
+    // 点输入框不再把已保存的 Key 清空，避免看起来像没了
     await user.click(apiKeyInput);
-    expect(apiKeyInput).toHaveValue("");
+    expect(apiKeyInput).toHaveValue("••••••••");
     await user.tab();
     expect(apiKeyInput).toHaveValue("••••••••");
+    // 只有主动点“更换”才进入输入状态
+    await user.click(screen.getByRole("button", { name: "更换" }));
+    expect(apiKeyInput).toHaveValue("");
+    expect(apiKeyInput).not.toHaveAttribute("readonly");
+    await user.type(apiKeyInput, "sk-new-key");
+    expect(apiKeyInput).toHaveValue("sk-new-key");
+    await user.tab();
+    expect(apiKeyInput).toHaveValue("sk-new-key");
     expect(invoke).not.toHaveBeenCalledWith("connection_key_get", expect.anything());
     expect(screen.queryByText(/AIHubMix · 1 个模型/)).not.toBeInTheDocument();
     expect(screen.queryByRole("button", { name: "保存模型配置" })).not.toBeInTheDocument();

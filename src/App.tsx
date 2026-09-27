@@ -103,6 +103,7 @@ type EditorState = {
   displayName: string;
   baseUrl: string;
   apiKey: string;
+  replaceCredential: boolean;
   modelId: string;
   savedModels: ModelConfig[];
   connected: boolean;
@@ -331,6 +332,7 @@ function newEditor(providerKind: ProviderKind): EditorState {
     displayName: defaults.name,
     baseUrl: defaults.baseUrl,
     apiKey: "",
+    replaceCredential: true,
     modelId: "",
     savedModels: [],
     connected: false,
@@ -472,6 +474,7 @@ export default function App() {
   const [running, setRunning] = useState(false);
   const [results, setResults] = useState<Record<string, ModelResult>>({});
   const [pendingConnectionRemoval, setPendingConnectionRemoval] = useState<string>();
+  const keyInputRef = useRef<HTMLInputElement>(null);
   const [pendingGroupClear, setPendingGroupClear] = useState<{
     outputType: OutputType;
     label: string;
@@ -593,7 +596,8 @@ export default function App() {
       catalogFilter: outputType,
       displayName: connection.displayName,
       baseUrl: connection.baseUrl,
-      apiKey: connection.hasCredential ? credentialMask : "",
+      apiKey: "",
+      replaceCredential: !connection.hasCredential,
       modelId: connection.providerKind === "openai_compatible" ? models[0]?.modelId ?? connection.models[0]?.modelId ?? "" : "",
       savedModels: connection.models,
       connected: true,
@@ -674,7 +678,7 @@ export default function App() {
           connectionId: editor.connectionId,
           providerKind: editor.providerKind,
           baseUrl: editor.baseUrl,
-          apiKey: editor.apiKey === credentialMask ? undefined : editor.apiKey || undefined,
+          apiKey: editor.replaceCredential ? editor.apiKey.trim() || undefined : undefined,
           outputType: catalogFilter,
         },
       });
@@ -714,7 +718,7 @@ export default function App() {
           connectionId: editor.connectionId,
           providerKind: editor.providerKind,
           baseUrl: editor.baseUrl,
-          apiKey: editor.apiKey === credentialMask ? undefined : editor.apiKey || undefined,
+          apiKey: editor.replaceCredential ? editor.apiKey.trim() || undefined : undefined,
           modelId: editor.modelId,
           outputType: editor.providerKind === "openai_compatible" ? editor.outputType : editor.catalogFilter,
           audioInput: editor.outputType === "audio_to_text" ? audioInput?.dataUrl : undefined,
@@ -758,7 +762,7 @@ export default function App() {
           displayName: editor.displayName,
           providerKind: editor.providerKind,
           baseUrl: editor.baseUrl,
-          apiKey: editor.apiKey === credentialMask ? undefined : editor.apiKey || undefined,
+          apiKey: editor.replaceCredential ? editor.apiKey.trim() || undefined : undefined,
           outputType: editor.providerKind === "openai_compatible" ? editor.outputType : editor.catalogFilter,
           supportsReferenceImage: modelIds.some((id) => editor.imageCapableModels.includes(id)),
           validationToken: editor.validationToken,
@@ -1306,23 +1310,35 @@ export default function App() {
                         <input value={editor.baseUrl} onChange={(event) => updateEditor("baseUrl", event.target.value)} placeholder="https://api.example.com/v1" inputMode="url" required />
                       </label>
                     )}
-                    <label>
-                      <span>API Key {!editor.connectionId && <b>*</b>}</span>
+                    <div className="credential-field">
+                      <span className="credential-label">
+                        <label htmlFor="connection-api-key">API Key {!editor.connectionId && <b>*</b>}</label>
+                        {!editor.replaceCredential && <button
+                          type="button"
+                          className="credential-replace"
+                          onClick={() => {
+                            setEditor((current) => current ? { ...current, replaceCredential: true, apiKey: "", validationToken: "" } : current);
+                            setNotice("");
+                            keyInputRef.current?.focus();
+                          }}
+                        >更换</button>}
+                      </span>
                       <input
-                        value={editor.apiKey}
+                        id="connection-api-key"
+                        ref={keyInputRef}
+                        value={editor.replaceCredential ? editor.apiKey : credentialMask}
+                        readOnly={!editor.replaceCredential}
                         onChange={(event) => updateEditor("apiKey", event.target.value)}
-                        onFocus={() => {
-                          if (editor.apiKey === credentialMask) updateEditor("apiKey", "");
-                        }}
                         onBlur={() => {
-                          if (editor.hasCredential && !editor.apiKey) updateEditor("apiKey", credentialMask);
+                          if (!editor.hasCredential || !editor.replaceCredential || editor.apiKey.trim()) return;
+                          setEditor((current) => current ? { ...current, replaceCredential: false, apiKey: "" } : current);
                         }}
                         type="password"
                         autoComplete="off"
-                        placeholder={editor.hasCredential ? "已保存在本软件；点击可替换" : "仅保存在本软件中"}
+                        placeholder={editor.hasCredential ? "已保存在本软件" : "仅保存在本软件中"}
                         required={!editor.connectionId}
                       />
-                    </label>
+                    </div>
                     {editor.providerKind === "openai_compatible" && (
                       <label>
                         <span>模型 ID <b>*</b></span>
