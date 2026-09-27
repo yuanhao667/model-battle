@@ -23,11 +23,12 @@ describe("App", () => {
     });
   });
 
-  it("opens the homepage without requesting credential access", async () => {
+  it("opens the homepage without touching anything but the config", async () => {
     render(<App />);
 
     expect(await screen.findByRole("button", { name: "模型 Battle" })).toHaveAttribute("aria-current", "page");
-    expect(invoke).not.toHaveBeenCalledWith("keychain_access_prepare");
+    expect(invoke).toHaveBeenCalledTimes(1);
+    expect(invoke).toHaveBeenCalledWith("settings_get");
   });
 
   it("switches empty arena types and opens the matching settings category", async () => {
