@@ -166,13 +166,10 @@ h1, h2, h3 { font-weight: 400; }
 .model-pool { overflow: hidden; border: 1px solid var(--border); border-radius: 4px; background: var(--input-surface); }
 .model-pool > .model-category:first-child { border-top: 0; }
 .empty-group { margin: 0; padding: 20px 14px; border-top: 1px solid var(--border); color: var(--muted); font-size: 12px; }
-.connection-management { display: block; }
-.connection-source-list { overflow: hidden; border: 1px solid var(--border); border-radius: 4px; background: var(--input-surface); }
 .section-card-header { min-height: 38px; display: flex; align-items: center; padding: 6px 13px; background: var(--elevated-soft); }
 .section-card-header h3 { margin: 0; font-size: 12px; font-weight: 500; }
 .connection-source-row { min-height: 48px; display: flex; align-items: center; justify-content: space-between; gap: 18px; padding: 8px 12px; }
 .connection-source-row + .connection-source-row { border-top: 1px solid var(--border); }
-.section-card-header + .connection-source-row { border-top: 1px solid var(--border); }
 .connection-source-row > div:first-child { min-width: 0; display: grid; gap: 3px; }
 .connection-source-row > div:first-child strong { overflow: hidden; font-size: 13px; text-overflow: ellipsis; white-space: nowrap; }
 .connection-source-row > div:first-child span { color: var(--muted); font-size: 11px; }
@@ -214,17 +211,24 @@ h1, h2, h3 { font-weight: 400; }
 
 .add-section { overflow: hidden; padding: 0; border: 1px solid var(--border); border-radius: 4px; background: var(--input-surface); }
 .add-section .section-card-header { border-bottom: 1px solid var(--border); }
-.provider-options { display: grid; grid-template-columns: repeat(3, 1fr); gap: 8px; padding: 12px; }
-.provider-options button { min-height: 78px; display: flex; align-items: center; gap: 10px; padding: 12px; text-align: left; border: 1px dashed var(--border); border-radius: 4px; color: var(--accent); background: var(--canvas); }
-.provider-options button:hover { border-color: var(--accent); background: var(--elevated); }
-.provider-options button > svg { width: 18px; height: 18px; flex: 0 0 auto; fill: none; stroke: var(--muted); stroke-width: 1.5; stroke-linecap: round; }
-.provider-option-copy { min-width: 0; display: grid; gap: 5px; }
-.provider-option-copy > span { color: var(--muted); font-size: 12px; }
-.provider-options button:hover > svg { stroke: var(--accent); }
+.provider-options { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); grid-auto-rows: 1fr; align-items: stretch; gap: 8px; padding: 12px; }
+.provider-card { position: relative; display: flex; flex-direction: column; gap: 5px; min-height: 116px; padding: 12px; border-radius: 4px; background: var(--input-surface); }
+.provider-card.is-add { border: 1px dashed var(--border); }
+.provider-card.is-connected { border: 1px solid var(--border); }
+.provider-card-title { display: flex; align-items: center; gap: 8px; min-width: 0; }
+.provider-card-title > strong { min-width: 0; overflow: hidden; font-size: 15px; font-weight: 500; line-height: 1.35; text-overflow: ellipsis; white-space: nowrap; }
+.provider-badge { flex: 0 0 auto; padding: 1px 6px; border-radius: 3px; color: var(--color-verdant); background: var(--elevated-soft); font-size: 10px; font-weight: 500; white-space: nowrap; }
+.provider-badge.is-missing { color: var(--color-amber); }
+.provider-card-meta { color: var(--muted); font-size: 12px; line-height: 1.5; }
+.provider-card-actions { display: flex; gap: 6px; margin-top: auto; padding-top: 10px; }
+.provider-option:hover > svg { stroke: var(--accent); }
 
 .connection-editor { height: 100%; min-height: 0; display: flex; flex-direction: column; gap: 12px; }
 .editor-header { display: flex; align-items: flex-start; justify-content: space-between; gap: 20px; }
 .editor-header h3 { margin: 0; font-size: 18px; font-weight: 400; letter-spacing: -.005em; }
+.editor-close { width: 28px; height: 28px; display: grid; flex: 0 0 auto; place-items: center; margin: -2px 0 0; padding: 0; border: 0; border-radius: 4px; color: var(--muted); background: transparent; }
+.editor-close:hover { color: var(--accent); background: var(--elevated-soft); }
+.editor-close svg { width: 16px; height: 16px; fill: none; stroke: currentColor; stroke-width: 1.5; stroke-linecap: round; }
 .editor-header p { margin: 5px 0 0; color: var(--muted); font-size: 12px; }
 .type-filter { display: flex; flex: 0 0 auto; flex-wrap: nowrap; gap: 6px; }
 .type-filter button { height: 30px; padding: 0 10px; border: 1px solid var(--border); border-radius: 4px; color: var(--muted); background: var(--surface); font-size: 11px; font-weight: 500; white-space: nowrap; }
@@ -239,7 +243,7 @@ h1, h2, h3 { font-weight: 400; }
 .connection-editor label > span { color: var(--muted); font-size: 11px; font-weight: 500; }
 .credential-field { display: grid; gap: 7px; }
 .credential-label { display: flex; align-items: center; justify-content: space-between; gap: 8px; }
-.credential-label label { color: var(--muted); font-size: 11px; font-weight: 500; }
+.credential-label label { display: block; color: var(--muted); font-size: 11px; font-weight: 500; white-space: nowrap; }
 .credential-replace { padding: 0; border: 0; color: var(--muted); background: transparent; font-size: 11px; font-weight: 500; }
 .credential-replace:hover { color: var(--ember); text-decoration: underline; }
 .connection-editor input[readonly] { cursor: default; }

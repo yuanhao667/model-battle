@@ -38,7 +38,16 @@ type Connection = {
   providerKind: ProviderKind;
   baseUrl: string;
   hasCredential: boolean;
+  credentialLength?: number;
   models: ModelConfig[];
+};
+
+type ProviderCard = {
+  key: string;
+  kind: ProviderKind;
+  title: string;
+  sub: string;
+  connection?: Connection;
 };
 
 type ConnectionSaveResult = {
@@ -104,6 +113,7 @@ type EditorState = {
   baseUrl: string;
   apiKey: string;
   replaceCredential: boolean;
+  storedMask: string;
   modelId: string;
   savedModels: ModelConfig[];
   connected: boolean;
@@ -119,10 +129,15 @@ type EditorState = {
 
 const emptyConfig: AppConfig = { schemaVersion: 1, activeArenaType: "text", connections: [] };
 const credentialMask = "••••••••";
+// 已保存的 Key 按真实位数渲染圆点；后端没给长度时退回固定掩码。
+function maskOf(connection: Connection) {
+  const length = connection.credentialLength;
+  return connection.hasCredential && length && length > 0 ? "•".repeat(length) : credentialMask;
+}
 const providerDefaults: Record<ProviderKind, { name: string; baseUrl: string }> = {
   aihubmix: { name: "AIHubMix", baseUrl: "https://aihubmix.com/v1" },
   siliconflow: { name: "硅基流动", baseUrl: "https://api.siliconflow.cn/v1" },
-  openai_compatible: { name: "自定义单模型", baseUrl: "" },
+  openai_compatible: { name: "自定义模型", baseUrl: "" },
 };
 
 const settingsGroups: Array<{ label: string; outputType: OutputType }> = [
@@ -157,6 +172,10 @@ function EditIcon() {
 
 function PlusIcon() {
   return <svg viewBox="0 0 16 16" aria-hidden="true"><path d="M8 3v10M3 8h10" /></svg>;
+}
+
+function CloseIcon() {
+  return <svg viewBox="0 0 16 16" aria-hidden="true"><path d="m4.5 4.5 7 7m0-7-7 7" /></svg>;
 }
 
 function DownloadIcon() {
@@ -333,6 +352,7 @@ function newEditor(providerKind: ProviderKind): EditorState {
     baseUrl: defaults.baseUrl,
     apiKey: "",
     replaceCredential: true,
+    storedMask: credentialMask,
     modelId: "",
     savedModels: [],
     connected: false,
@@ -474,6 +494,7 @@ export default function App() {
   const [running, setRunning] = useState(false);
   const [results, setResults] = useState<Record<string, ModelResult>>({});
   const [pendingConnectionRemoval, setPendingConnectionRemoval] = useState<string>();
+  const [pendingKeyClear, setPendingKeyClear] = useState<string>();
   const keyInputRef = useRef<HTMLInputElement>(null);
   const [pendingGroupClear, setPendingGroupClear] = useState<{
     outputType: OutputType;
@@ -494,6 +515,36 @@ export default function App() {
   ), [config]);
 
   const configuredConnections = useMemo(() => config.connections.filter((connection) => connection.models.length > 0), [config]);
+
+  // 集成平台连上之后，添加卡片原地变成"已连接"卡片（不能再加一条）；
+  // 自定义模型可以有多条，所以永远保留"添加"卡片。
+  const providerCards = useMemo<ProviderCard[]>(() => {
+    const cards: ProviderCard[] = [];
+    for (const spec of [
+      { kind: "aihubmix" as ProviderKind, title: "AIHubMix（梯子必须开全局模式）", sub: "填一次 Key，选择多个模型" },
+      { kind: "siliconflow" as ProviderKind, title: "硅基流动", sub: "填一次 Key，选择多个模型" },
+    ]) {
+      const connections = configuredConnections.filter((connection) => connection.providerKind === spec.kind);
+      if (!connections.length) cards.push({ key: `add-${spec.kind}`, ...spec });
+      else connections.forEach((connection) => cards.push({ ...spec, key: connection.id, connection }));
+    }
+    configuredConnections
+      .filter((connection) => connection.providerKind === "openai_compatible")
+      .forEach((connection) => cards.push({
+        key: connection.id,
+        kind: "openai_compatible",
+        title: connection.displayName,
+        sub: "连接独立 OpenAI 兼容接口",
+        connection,
+      }));
+    cards.push({ key: "add-openai_compatible", kind: "openai_compatible", title: "自定义模型", sub: "连接独立 OpenAI 兼容接口" });
+    return cards;
+  }, [configuredConnections]);
+
+  const pendingClearConnection = useMemo(
+    () => configuredConnections.find((connection) => connection.id === (pendingKeyClear ?? pendingConnectionRemoval)),
+    [configuredConnections, pendingKeyClear, pendingConnectionRemoval],
+  );
 
   const availableProviders = useMemo(() => Array.from(new Set(
     configuredConnections.map((connection) => connection.providerKind),
@@ -598,6 +649,7 @@ export default function App() {
       baseUrl: connection.baseUrl,
       apiKey: "",
       replaceCredential: !connection.hasCredential,
+      storedMask: maskOf(connection),
       modelId: connection.providerKind === "openai_compatible" ? models[0]?.modelId ?? connection.models[0]?.modelId ?? "" : "",
       savedModels: connection.models,
       connected: true,
@@ -850,19 +902,15 @@ export default function App() {
   }
 
   async function removeConnection(connection: Connection) {
-    if (pendingConnectionRemoval !== connection.id) {
-      setPendingConnectionRemoval(connection.id);
-      return;
-    }
     try {
       await invoke("connection_remove", { connectionId: connection.id });
       if (editor?.connectionId === connection.id) setEditor(undefined);
+      setPendingConnectionRemoval(undefined);
+      setPendingKeyClear(undefined);
       await refreshSettings();
     } catch (error) {
       setNotice(messageFrom(error));
       setNoticeSuccess(false);
-    } finally {
-      setPendingConnectionRemoval(undefined);
     }
   }
 
@@ -1259,33 +1307,6 @@ export default function App() {
                     </section>)}
                 </section>
 
-                {!!configuredConnections.length && <section className="connection-management">
-                  <div className="connection-source-list">
-                    <header className="section-card-header"><h3>连接来源</h3></header>
-                    {configuredConnections.map((connection) => <div className="connection-source-row" key={connection.id}>
-                      <div>
-                        <strong>{connection.displayName}</strong>
-                        <span>{providerLabel(connection.providerKind)} · {connectionTypeLabel(connection.models)} · {connection.models.length} 个模型</span>
-                      </div>
-                      <div className="row-actions">
-                        <button
-                          type="button"
-                          className="ghost-action"
-                          aria-label={`编辑${connection.displayName}`}
-                          title="编辑连接"
-                          onClick={() => startEdit(connection)}
-                        ><EditIcon /><span>编辑</span></button>
-                        <button
-                          type="button"
-                          className={`ghost-action danger-action ${pendingConnectionRemoval === connection.id ? "is-confirming" : ""}`}
-                          aria-label={`${pendingConnectionRemoval === connection.id ? "确认删除" : "删除"}${connection.displayName}`}
-                          title={pendingConnectionRemoval === connection.id ? "再次点击确认删除" : "删除连接"}
-                          onClick={() => removeConnection(connection)}
-                        ><TrashIcon /><span>{pendingConnectionRemoval === connection.id ? "确认删除" : "删除"}</span></button>
-                      </div>
-                    </div>)}
-                  </div>
-                </section>}
               </div>}
 
               {editor ? (
@@ -1297,6 +1318,13 @@ export default function App() {
                         ? "适用于只有单个 OpenAI 兼容模型地址的厂商。"
                         : "先连接平台，再按输出类型筛选并选择模型。"}</p>
                     </div>
+                    <button
+                      type="button"
+                      className="editor-close"
+                      aria-label="关闭连接编辑"
+                      title="关闭"
+                      onClick={() => setEditor(undefined)}
+                    ><CloseIcon /></button>
                   </header>
 
                   <div className="form-grid">
@@ -1326,7 +1354,7 @@ export default function App() {
                       <input
                         id="connection-api-key"
                         ref={keyInputRef}
-                        value={editor.replaceCredential ? editor.apiKey : credentialMask}
+                        value={editor.replaceCredential ? editor.apiKey : editor.storedMask}
                         readOnly={!editor.replaceCredential}
                         onChange={(event) => updateEditor("apiKey", event.target.value)}
                         onBlur={() => {
@@ -1533,9 +1561,51 @@ export default function App() {
                 <section className="add-section">
                   <header className="section-card-header"><h3>添加连接</h3></header>
                   <div className="provider-options">
-                    <button onClick={() => startAdd("aihubmix")}><PlusIcon /><span className="provider-option-copy"><strong>AIHubMix（梯子必须开全局模式）</strong><span>填一次 Key，选择多个模型</span></span></button>
-                    <button onClick={() => startAdd("siliconflow")}><PlusIcon /><span className="provider-option-copy"><strong>硅基流动</strong><span>填一次 Key，选择多个模型</span></span></button>
-                    <button onClick={() => startAdd("openai_compatible")}><PlusIcon /><span className="provider-option-copy"><strong>自定义单模型</strong><span>连接独立 OpenAI 兼容接口</span></span></button>
+                    {providerCards.map((card) => <article
+                      className={`provider-card ${card.connection ? "is-connected" : "is-add"}`}
+                      key={card.key}
+                      aria-label={card.connection ? `${card.connection.displayName} ${card.connection.hasCredential ? "已连接" : "缺少 API Key"}` : undefined}
+                    >
+                      <span className="provider-card-title">
+                        <strong>{card.title}</strong>
+                        {card.connection && <span className={`provider-badge ${card.connection.hasCredential ? "" : "is-missing"}`}>
+                          {card.connection.hasCredential ? "已连接" : "缺少 API Key"}
+                        </span>}
+                      </span>
+                      <span className="provider-card-meta">{card.connection
+                        ? `${providerLabel(card.connection.providerKind)} · ${connectionTypeLabel(card.connection.models)} · ${card.connection.models.length} 个模型`
+                        : card.sub}</span>
+                      <div className="provider-card-actions">
+                        {card.connection ? <>
+                          <button
+                            type="button"
+                            className="ghost-action"
+                            aria-label={`编辑${card.connection.displayName}`}
+                            title="编辑连接"
+                            onClick={() => startEdit(card.connection!)}
+                          ><EditIcon /><span>编辑</span></button>
+                          {card.connection.hasCredential ? <button
+                            type="button"
+                            className="ghost-action danger-action"
+                            aria-label={`清除 API Key：${card.connection.displayName}`}
+                            title="清除后，这个连接与它添加的模型会一起移除"
+                            onClick={() => setPendingKeyClear(card.connection!.id)}
+                          ><TrashIcon /><span>清除 API Key</span></button> : <button
+                            type="button"
+                            className="ghost-action danger-action"
+                            aria-label={`删除${card.connection.displayName}`}
+                            title="删除这个连接"
+                            onClick={() => setPendingConnectionRemoval(card.connection!.id)}
+                          ><TrashIcon /><span>删除连接</span></button>}
+                        </> : <button
+                          type="button"
+                          className="ghost-action"
+                          aria-label={`添加${card.title}`}
+                          title="添加连接"
+                          onClick={() => startAdd(card.kind)}
+                        ><PlusIcon /><span>添加</span></button>}
+                      </div>
+                    </article>)}
                   </div>
                 </section>
               )}
@@ -1543,6 +1613,25 @@ export default function App() {
           </section>
       )}
       {notice && <div className={`global-toast ${noticeSuccess ? "is-success" : "is-error"}`} role="alert" aria-live="assertive"><ToastIcon success={noticeSuccess} /><span>{notice}</span></div>}
+      {pendingClearConnection && <div
+        className="confirm-overlay"
+        role="presentation"
+        onMouseDown={(event) => {
+          if (event.target === event.currentTarget) { setPendingKeyClear(undefined); setPendingConnectionRemoval(undefined); }
+        }}
+      >
+        <section className="confirm-dialog" role="dialog" aria-modal="true" aria-labelledby="clear-key-dialog-title">
+          <h2 id="clear-key-dialog-title">{pendingClearConnection.hasCredential ? "确认清除 API Key？" : "确认删除连接？"}</h2>
+          <p>{pendingClearConnection.hasCredential
+            ? `将删除连接「${pendingClearConnection.displayName}」、它已保存的 API Key，以及通过它添加的 ${pendingClearConnection.models.length} 个模型配置。此操作无法撤销。`
+            : `将删除连接「${pendingClearConnection.displayName}」及其 ${pendingClearConnection.models.length} 个模型配置。此操作无法撤销。`}</p>
+          <div className="confirm-actions">
+            <button type="button" autoFocus onClick={() => { setPendingKeyClear(undefined); setPendingConnectionRemoval(undefined); }}>取消</button>
+            <button type="button" className="confirm-danger" onClick={() => void removeConnection(pendingClearConnection)}>{pendingClearConnection.hasCredential ? "确认清除" : "确认删除"}</button>
+          </div>
+        </section>
+      </div>}
+
       {pendingGroupClear && <div
         className="confirm-overlay"
         role="presentation"

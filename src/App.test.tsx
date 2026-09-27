@@ -1,4 +1,4 @@
-import { cleanup, render, screen, waitFor } from "@testing-library/react";
+import { cleanup, render, screen, waitFor, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import App from "./App";
@@ -65,7 +65,7 @@ describe("App", () => {
     expect(screen.getByRole("button", { name: "模型配置" })).toHaveAttribute("aria-current", "page");
     expect(screen.getByRole("button", { name: /AIHubMix/ })).toBeInTheDocument();
     expect(screen.getByRole("button", { name: /硅基流动/ })).toBeInTheDocument();
-    expect(screen.getByRole("button", { name: /自定义单模型/ })).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: /自定义模型/ })).toBeInTheDocument();
 
     await user.click(screen.getByRole("button", { name: /AIHubMix/ }));
     expect(screen.getByRole("heading", { name: "连接 AIHubMix" })).toBeInTheDocument();
@@ -347,9 +347,39 @@ describe("App", () => {
       modelConfigId: "model-1",
     });
 
+    // 有 Key 时卡片上的危险动作是"清除 API Key"：弹窗二次确认，确认后连模型一起移除
+    await user.click(screen.getByRole("button", { name: "清除 API Key：AIHubMix" }));
+    const dialog = screen.getByRole("dialog", { name: "确认清除 API Key？" });
+    expect(within(dialog).getByText(/1 个模型配置/)).toBeInTheDocument();
+    await user.click(within(dialog).getByRole("button", { name: "确认清除" }));
+    expect(invoke).toHaveBeenCalledWith("connection_remove", { connectionId: "connection-1" });
+  });
+
+  it("offers 删除连接 once the saved key is cleared", async () => {
+    invoke.mockImplementation((command: string) => {
+      if (command === "settings_get") return Promise.resolve({
+        schemaVersion: 1,
+        activeArenaType: "text",
+        connections: [{
+          id: "connection-1",
+          displayName: "AIHubMix",
+          providerKind: "aihubmix",
+          baseUrl: "https://aihubmix.com/v1",
+          hasCredential: false,
+          models: [{ id: "model-1", modelId: "gpt-5", displayName: "gpt-5", outputType: "text", supportsReferenceImage: false, enabled: true }],
+        }],
+      });
+      return Promise.resolve({});
+    });
+    const user = userEvent.setup();
+    render(<App />);
+    await user.click(await screen.findByRole("button", { name: "模型配置" }));
+
+    expect(screen.getByText("缺少 API Key")).toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: /清除 API Key/ })).not.toBeInTheDocument();
     await user.click(screen.getByRole("button", { name: "删除AIHubMix" }));
-    expect(screen.getByRole("button", { name: "确认删除AIHubMix" })).toBeInTheDocument();
-    await user.click(screen.getByRole("button", { name: "确认删除AIHubMix" }));
+    const dialog = screen.getByRole("dialog", { name: "确认删除连接？" });
+    await user.click(within(dialog).getByRole("button", { name: "确认删除" }));
     expect(invoke).toHaveBeenCalledWith("connection_remove", { connectionId: "connection-1" });
   });
 
@@ -443,7 +473,7 @@ describe("App", () => {
     expect(screen.getAllByText("公司内部模型").length).toBeGreaterThan(0);
     expect(screen.getByRole("checkbox", { name: "筛选来源：AIHubMix" })).toBeChecked();
     expect(screen.getByRole("checkbox", { name: "筛选来源：硅基流动" })).toBeChecked();
-    expect(screen.getByRole("checkbox", { name: "筛选来源：自定义单模型" })).toBeChecked();
+    expect(screen.getByRole("checkbox", { name: "筛选来源：自定义模型" })).toBeChecked();
     await user.click(screen.getByRole("checkbox", { name: "筛选来源：AIHubMix" }));
     expect(screen.queryByText("gpt-5")).not.toBeInTheDocument();
     expect(screen.getByText("deepseek-v3")).toBeInTheDocument();
@@ -548,7 +578,7 @@ describe("App", () => {
     expect(screen.getByRole("button", { name: "视频生成模型" })).toBeEnabled();
     await user.click(screen.getByRole("button", { name: "取消" }));
 
-    await user.click(screen.getByRole("button", { name: /自定义单模型/ }));
+    await user.click(screen.getByRole("button", { name: /自定义模型/ }));
     expect(screen.getByRole("button", { name: "文本生成模型" })).toBeEnabled();
     expect(screen.getByRole("button", { name: "图片生成模型" })).toBeEnabled();
     expect(screen.getByRole("button", { name: "音频模型" })).toBeEnabled();
@@ -791,5 +821,72 @@ describe("App", () => {
     expect(screen.queryByRole("checkbox", { name: /筛选来源/ })).not.toBeInTheDocument();
     // 筛选行藏起来时，唯一来源的模型依旧要全部列出
     expect(screen.getByText("deepseek-v3")).toBeInTheDocument();
+  });
+  it("turns the add card into a connected card once the platform is configured", async () => {
+    invoke.mockImplementation((command: string) => {
+      if (command === "settings_get") return Promise.resolve({
+        schemaVersion: 1,
+        activeArenaType: "text",
+        connections: [{
+          id: "c1", displayName: "硅基流动", providerKind: "siliconflow",
+          baseUrl: "https://api.siliconflow.cn/v1", hasCredential: true, credentialLength: 51,
+          models: [{ id: "m1", modelId: "deepseek", displayName: "deepseek", outputType: "text", supportsReferenceImage: false, enabled: true }],
+        }],
+      });
+      return Promise.resolve({});
+    });
+    const user = userEvent.setup();
+    render(<App />);
+    await user.click(await screen.findByRole("button", { name: "模型配置" }));
+
+    // 硅基流动那张添加卡片原地变成"已连接"卡片：右上角标签、摘要、编辑/删除
+    const connected = screen.getByRole("article", { name: "硅基流动 已连接" });
+    expect(within(connected).getByText("已连接")).toBeInTheDocument();
+    expect(within(connected).getByRole("button", { name: "编辑硅基流动" })).toBeInTheDocument();
+    expect(within(connected).getByText(/文本生成模型 · 1 个模型/)).toBeInTheDocument();
+    expect(within(connected).getByRole("button", { name: "编辑硅基流动" })).toBeInTheDocument();
+    expect(within(connected).getByRole("button", { name: /清除 API Key/ })).toBeInTheDocument();
+    expect(within(connected).queryByText("填一次 Key，选择多个模型")).not.toBeInTheDocument();
+    // 集成平台已连接就不再提供"添加"入口，只有自定义模型能继续加
+    expect(screen.queryByRole("button", { name: "添加硅基流动" })).not.toBeInTheDocument();
+    const addCard = screen.getByRole("button", { name: /添加AIHubMix/ }).closest("article");
+    expect(addCard).toHaveClass("provider-card", "is-add");
+    expect(within(addCard as HTMLElement).getByText("填一次 Key，选择多个模型")).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "添加自定义模型" })).toBeInTheDocument();
+    // 原来的"连接来源"卡片彻底没有了
+    expect(screen.queryByText("连接来源")).not.toBeInTheDocument();
+  });
+
+  it("renders the stored key mask with the real key length", async () => {
+    invoke.mockImplementation((command: string) => {
+      if (command === "settings_get") return Promise.resolve({
+        schemaVersion: 1,
+        activeArenaType: "text",
+        connections: [{
+          id: "c1", displayName: "硅基流动", providerKind: "siliconflow",
+          baseUrl: "https://api.siliconflow.cn/v1", hasCredential: true, credentialLength: 51,
+          models: [{ id: "m1", modelId: "deepseek", displayName: "deepseek", outputType: "text", supportsReferenceImage: false, enabled: true }],
+        }],
+      });
+      return Promise.resolve({});
+    });
+    const user = userEvent.setup();
+    render(<App />);
+    await user.click(await screen.findByRole("button", { name: "模型配置" }));
+    await user.click(screen.getByRole("button", { name: "编辑硅基流动" }));
+
+    expect(screen.getByLabelText(/API Key/)).toHaveValue("•".repeat(51));
+  });
+
+  it("closes the connection editor from the header icon", async () => {
+    const user = userEvent.setup();
+    render(<App />);
+    await user.click(await screen.findByRole("button", { name: /添加模型连接/ }));
+    await user.click(screen.getByRole("button", { name: /AIHubMix/ }));
+    expect(screen.getByRole("heading", { name: "连接 AIHubMix" })).toBeInTheDocument();
+
+    await user.click(screen.getByRole("button", { name: "关闭连接编辑" }));
+    expect(screen.queryByRole("heading", { name: "连接 AIHubMix" })).not.toBeInTheDocument();
+    expect(screen.getByText("添加连接")).toBeInTheDocument();
   });
 });

@@ -76,6 +76,10 @@ struct Connection {
     provider_kind: String,
     base_url: String,
     has_credential: bool,
+    /// 派生字段：每次返回给界面之前都会按凭据重算，磁盘上的值可能过期。
+    /// 注意不能用 `skip` —— 那是连序列化一起跳过，前端就收不到了。
+    #[serde(default)]
+    credential_length: Option<usize>,
     models: Vec<ModelConfig>,
 }
 
@@ -1872,9 +1876,24 @@ fn parse_catalog(body: CatalogResponse, output_type: &str) -> AppResult<Vec<Cata
     Ok(models)
 }
 
+fn apply_credential_lengths(config: &mut AppConfig, keys: &HashMap<String, String>) {
+    for connection in &mut config.connections {
+        connection.credential_length = keys
+            .get(&connection.id)
+            .map(|key| key.trim().chars().count())
+            .filter(|length| *length > 0);
+    }
+}
+
+fn read_config_for_ui(state: &AppState) -> AppResult<AppConfig> {
+    let mut config = load_config(&state.config_path)?;
+    apply_credential_lengths(&mut config, &cached_credentials(state)?);
+    Ok(config)
+}
+
 #[tauri::command]
 fn settings_get(state: State<'_, AppState>) -> AppResult<AppConfig> {
-    load_config(&state.config_path)
+    read_config_for_ui(state.inner())
 }
 
 fn activate_output_type(config: &mut AppConfig, output_type: &str) {
@@ -1887,6 +1906,7 @@ fn arena_type_set(output_type: String, state: State<'_, AppState>) -> AppResult<
     let mut config = load_config(&state.config_path)?;
     activate_output_type(&mut config, &output_type);
     save_config(&state.config_path, &config)?;
+    apply_credential_lengths(&mut config, &cached_credentials(state.inner())?);
     Ok(config)
 }
 
@@ -1907,6 +1927,7 @@ fn system_prompt_set(
             .insert(output_type, trimmed.to_string());
     }
     save_config(&state.config_path, &config)?;
+    apply_credential_lengths(&mut config, &cached_credentials(state.inner())?);
     Ok(config)
 }
 
@@ -2443,6 +2464,7 @@ async fn connection_save(
         provider_kind: input.provider_kind,
         base_url: normalized_base,
         has_credential: true,
+        credential_length: None,
         models,
     };
 
@@ -3188,6 +3210,64 @@ mod tests {
     }
 
     #[test]
+    fn fills_credential_lengths_without_persisting_them() {
+        let mut config = AppConfig::default();
+        config.connections.push(Connection {
+            id: "connection".into(),
+            display_name: "test".into(),
+            provider_kind: "siliconflow".into(),
+            base_url: "https://api.siliconflow.cn/v1".into(),
+            has_credential: true,
+            credential_length: None,
+            models: Vec::new(),
+        });
+        let keys = HashMap::from([("connection".to_string(), "sk-1234567890".to_string())]);
+        apply_credential_lengths(&mut config, &keys);
+        assert_eq!(config.connections[0].credential_length, Some(13));
+
+        // 必须序列化给前端，否则界面上只能退回固定掩码
+        let encoded = serde_json::to_vec(&config).expect("config should serialize");
+        assert!(String::from_utf8_lossy(&encoded).contains("credentialLength"));
+    }
+
+    #[test]
+    fn reads_config_with_credential_lengths_for_the_ui() {
+        let directory = std::env::temp_dir().join(format!("model-battle-ui-{}", Uuid::new_v4()));
+        let config_path = directory.join("config.json");
+        let credentials_path = directory.join("credentials.json");
+        let mut config = AppConfig::default();
+        config.connections.push(Connection {
+            id: "c1".into(),
+            display_name: "test".into(),
+            provider_kind: "siliconflow".into(),
+            base_url: "https://api.siliconflow.cn/v1".into(),
+            has_credential: true,
+            credential_length: None,
+            models: Vec::new(),
+        });
+        save_config(&config_path, &config).expect("save config");
+        write_credentials(
+            &credentials_path,
+            &HashMap::from([("c1".to_string(), "sk-1234567890".to_string())]),
+        )
+        .expect("save credentials");
+
+        let state = AppState {
+            config_path,
+            credentials_path,
+            credential_cache: Arc::new(Mutex::new(None)),
+            validated_connections: Arc::new(Mutex::new(HashMap::new())),
+            current_run: Arc::new(Mutex::new(None)),
+        };
+        let view = read_config_for_ui(&state).expect("read config for ui");
+        assert_eq!(view.connections[0].credential_length, Some(13));
+        assert!(serde_json::to_string(&view)
+            .expect("serialize view")
+            .contains("\"credentialLength\":13"));
+        let _ = fs::remove_dir_all(&directory);
+    }
+
+    #[test]
     fn merges_system_prompt_into_media_prompts() {
         let system = Some("保持冷色调".to_string());
         assert_eq!(merge_system_prompt(&system, "一只猫"), "保持冷色调\n\n一只猫");
@@ -3280,6 +3360,7 @@ mod tests {
                 provider_kind: "aihubmix".into(),
                 base_url: "https://aihubmix.com/v1".into(),
                 has_credential: true,
+                credential_length: None,
                 models: vec![
                     ModelConfig {
                         id: "text".into(),
@@ -3338,6 +3419,7 @@ mod tests {
                     provider_kind: "aihubmix".into(),
                     base_url: "https://aihubmix.com/v1".into(),
                     has_credential: true,
+                    credential_length: None,
                     models: vec![model("gpt-5", "text")],
                 },
                 Connection {
@@ -3346,6 +3428,7 @@ mod tests {
                     provider_kind: "aihubmix".into(),
                     base_url: "https://aihubmix.com/v1".into(),
                     has_credential: true,
+                    credential_length: None,
                     models: vec![model("gpt-5", "text"), model("flux", "image")],
                 },
                 Connection {
@@ -3354,6 +3437,7 @@ mod tests {
                     provider_kind: "siliconflow".into(),
                     base_url: "https://api.siliconflow.cn/v1".into(),
                     has_credential: true,
+                    credential_length: None,
                     models: vec![model("deepseek", "text")],
                 },
             ],
@@ -3397,6 +3481,7 @@ mod tests {
             provider_kind: provider_kind.into(),
             base_url: "https://example.com/v1".into(),
             has_credential: true,
+            credential_length: None,
             models,
         };
         let mut config = AppConfig {
@@ -3434,6 +3519,7 @@ mod tests {
                 provider_kind: "aihubmix".into(),
                 base_url: "https://aihubmix.com/v1".into(),
                 has_credential: true,
+                credential_length: None,
                 models: vec![
                     ModelConfig {
                         id: "text".into(),
@@ -3602,6 +3688,7 @@ mod tests {
                 provider_kind: "siliconflow".into(),
                 base_url: "https://api.siliconflow.cn/v1".into(),
                 has_credential: true,
+                credential_length: None,
                 models: vec![ModelConfig {
                     id: "failed-model-config".into(),
                     model_id: "broken-model".into(),
