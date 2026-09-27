@@ -696,4 +696,89 @@ describe("App", () => {
     await user.keyboard("{Enter}");
     await waitFor(() => expect(invoke).toHaveBeenCalledWith("text_run_start", expect.anything()));
   });
+
+  it("marks the system prompt as unset then set, and saves it for the current arena type", async () => {
+    invoke.mockImplementation((command: string, args?: { systemPrompt?: string; outputType?: string }) => {
+      if (command === "settings_get") return Promise.resolve(emptyConfig);
+      if (command === "system_prompt_set") {
+        const value = args?.systemPrompt?.trim();
+        return Promise.resolve({
+          ...emptyConfig,
+          systemPrompts: value ? { [args?.outputType ?? "text"]: value } : {},
+        });
+      }
+      return Promise.resolve({});
+    });
+    const user = userEvent.setup();
+    render(<App />);
+
+    const status = await screen.findByRole("button", { name: /系统提示词/ });
+    expect(status.querySelector(".system-prompt-dot")).not.toHaveClass("is-set");
+
+    await user.click(status);
+    await user.type(screen.getByPlaceholderText(/你是严谨的技术编辑/), "只输出结论");
+    await user.click(screen.getByRole("button", { name: "保存" }));
+
+    await waitFor(() => expect(invoke).toHaveBeenCalledWith("system_prompt_set", {
+      outputType: "text",
+      systemPrompt: "只输出结论",
+    }));
+    await waitFor(() => expect(document.querySelector(".system-prompt-dot")).toHaveClass("is-set"));
+  });
+
+  it("keeps the system prompt control on every arena type and reads its own value", async () => {
+    let activeArenaType = { value: "text" };
+    invoke.mockImplementation((command: string, args?: { outputType?: string }) => {
+      if (command === "settings_get") {
+        return Promise.resolve({ ...emptyConfig, activeArenaType: activeArenaType.value, systemPrompts: { text: "只输出结论" } });
+      }
+      if (command === "arena_type_set") {
+        activeArenaType.value = args?.outputType ?? "text";
+        return Promise.resolve({ ...emptyConfig, activeArenaType: activeArenaType.value, systemPrompts: { text: "只输出结论" } });
+      }
+      return Promise.resolve({});
+    });
+    const user = userEvent.setup();
+    render(<App />);
+
+    // 文本模式：显示已设置
+    const textStatus = await screen.findByRole("button", { name: /系统提示词/ });
+    expect(textStatus.querySelector(".system-prompt-dot")).toHaveClass("is-set");
+
+    // 切到图片生成：控件仍在，且因为这类没设过而回到未设置
+    await user.click(screen.getByRole("button", { name: "图片生成模型" }));
+    await waitFor(() => expect(screen.getByRole("button", { name: "图片生成模型" })).toHaveAttribute("aria-pressed", "true"));
+    const imageStatus = screen.getByRole("button", { name: /系统提示词/ });
+    expect(imageStatus.querySelector(".system-prompt-dot")).not.toHaveClass("is-set");
+
+    await user.click(imageStatus);
+    expect(screen.getByText(/会拼接在提示词前面/)).toBeInTheDocument();
+    expect(screen.getByPlaceholderText(/你是严谨的技术编辑/)).toHaveValue("");
+  });
+
+  it("hides the source filter when only one source is configured", async () => {
+    invoke.mockImplementation((command: string) => {
+      if (command === "settings_get") return Promise.resolve({
+        schemaVersion: 1,
+        activeArenaType: "text",
+        connections: [{
+          id: "siliconflow",
+          displayName: "硅基流动",
+          providerKind: "siliconflow",
+          baseUrl: "https://api.siliconflow.cn/v1",
+          hasCredential: true,
+          models: [{ id: "deepseek", modelId: "deepseek-v3", displayName: "deepseek-v3", outputType: "text", supportsReferenceImage: false, enabled: true }],
+        }],
+      });
+      return Promise.resolve({});
+    });
+    const user = userEvent.setup();
+    render(<App />);
+    await user.click(await screen.findByRole("button", { name: "模型配置" }));
+
+    expect(screen.queryByRole("group", { name: "来源筛选" })).not.toBeInTheDocument();
+    expect(screen.queryByRole("checkbox", { name: /筛选来源/ })).not.toBeInTheDocument();
+    // 筛选行藏起来时，唯一来源的模型依旧要全部列出
+    expect(screen.getByText("deepseek-v3")).toBeInTheDocument();
+  });
 });

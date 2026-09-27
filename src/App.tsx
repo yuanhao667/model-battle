@@ -50,6 +50,15 @@ type AppConfig = {
   schemaVersion: number;
   activeArenaType: OutputType;
   connections: Connection[];
+  systemPrompts?: Partial<Record<OutputType, string>>;
+};
+
+const systemPromptHints: Record<OutputType, string> = {
+  text: "作为 system 消息发送给所有文本模型，留空即视为未设置。",
+  image: "会拼接在提示词前面，发给所有图片生成模型，留空即视为未设置。",
+  video: "会拼接在提示词前面，发给所有视频生成模型，留空即视为未设置。",
+  audio: "语音合成接口没有系统提示词，仅 AIHubMix 的对话语音模型会收到。",
+  audio_to_text: "会作为识别提示（prompt）发给所有转写模型，留空即视为未设置。",
 };
 
 type Usage = {
@@ -221,6 +230,92 @@ function SelectMenu({
           setOpen(false);
         }}
       >{option.label}</button>)}
+    </div>}
+  </div>;
+}
+
+function SystemPromptControl({
+  outputType,
+  systemPrompt,
+  onSave,
+}: {
+  outputType: OutputType;
+  systemPrompt?: string | null;
+  onSave: (value: string) => Promise<void>;
+}) {
+  const [open, setOpen] = useState(false);
+  const [draft, setDraft] = useState(systemPrompt ?? "");
+  const [saving, setSaving] = useState(false);
+  const rootRef = useRef<HTMLDivElement>(null);
+  const hasSystemPrompt = Boolean(systemPrompt?.trim());
+
+  useEffect(() => {
+    setDraft(systemPrompt ?? "");
+  }, [systemPrompt]);
+
+  useEffect(() => {
+    if (!open) return;
+    const closeOutside = (event: PointerEvent) => {
+      if (!rootRef.current?.contains(event.target as Node)) setOpen(false);
+    };
+    const closeOnEscape = (event: KeyboardEvent) => {
+      if (event.key === "Escape") setOpen(false);
+    };
+    document.addEventListener("pointerdown", closeOutside);
+    document.addEventListener("keydown", closeOnEscape);
+    return () => {
+      document.removeEventListener("pointerdown", closeOutside);
+      document.removeEventListener("keydown", closeOnEscape);
+    };
+  }, [open]);
+
+  async function submit(value: string) {
+    setSaving(true);
+    try {
+      await onSave(value);
+      setOpen(false);
+    } catch {
+      // 失败时保留面板，方便修改后重试。
+    } finally {
+      setSaving(false);
+    }
+  }
+
+  return <div className={`system-prompt-field ${open ? "is-open" : ""}`} ref={rootRef}>
+    <button
+      type="button"
+      className="system-prompt-control"
+      aria-haspopup="dialog"
+      aria-expanded={open}
+      title={hasSystemPrompt ? "已设置系统提示词，点击编辑" : "尚未设置系统提示词，点击设置"}
+      onClick={() => setOpen((current) => !current)}
+    >
+      <i className={`system-prompt-dot ${hasSystemPrompt ? "is-set" : ""}`} aria-hidden="true" />
+      <span className="system-prompt-label">系统提示词</span>
+    </button>
+    {open && <div className="system-prompt-popover" role="dialog" aria-label="设置系统提示词">
+      <p className="system-prompt-hint">{systemPromptHints[outputType]}</p>
+      <textarea
+        className="system-prompt-input"
+        value={draft}
+        autoFocus
+        placeholder="例如：你是严谨的技术编辑，回答先给结论，再给依据。"
+        onChange={(event) => setDraft(event.target.value)}
+      />
+      <div className="system-prompt-actions">
+        <button
+          type="button"
+          className="secondary-button"
+          disabled={saving || !hasSystemPrompt}
+          onClick={() => void submit("")}
+        >清空</button>
+        <button
+          type="button"
+          className="primary-button"
+          disabled={saving}
+          onClick={() => void submit(draft)}
+        >{saving ? "保存中…" : "保存"}</button>
+      </div>
     </div>}
   </div>;
 }
@@ -401,16 +496,19 @@ export default function App() {
     configuredConnections.map((connection) => connection.providerKind),
   )), [configuredConnections]);
 
+  // 只有一个来源时筛选没有意义，隐藏筛选行并直接忽略筛选值（避免被隐藏的旧勾选状态把模型藏起来）。
+  const sourceFilterActive = availableProviders.length > 1;
+
   const settingsModelGroups = useMemo(() => settingsGroups
     .filter((group) => group.outputType === settingsOutputType)
     .map((group) => ({
       ...group,
       models: config.connections
-        .filter((connection) => sourceFilters.includes(connection.providerKind))
+        .filter((connection) => !sourceFilterActive || sourceFilters.includes(connection.providerKind))
         .flatMap((connection) => connection.models
           .filter((model) => model.outputType === group.outputType)
           .map((model) => ({ connection, model }))),
-    })), [config, settingsOutputType, sourceFilters]);
+    })), [config, settingsOutputType, sourceFilters, sourceFilterActive]);
 
   async function refreshSettings() {
     try {
@@ -723,6 +821,19 @@ export default function App() {
     }
   }
 
+  async function saveSystemPrompt(outputType: OutputType, value: string) {
+    try {
+      const updated = await invoke<AppConfig>("system_prompt_set", { outputType, systemPrompt: value });
+      setConfig(updated);
+      setNotice(value.trim() ? `${arenaTypeLabel(outputType)}的系统提示词已保存。` : `${arenaTypeLabel(outputType)}的系统提示词已清空。`);
+      setNoticeSuccess(true);
+    } catch (error) {
+      setNotice(messageFrom(error));
+      setNoticeSuccess(false);
+      throw error;
+    }
+  }
+
   async function setArenaType(outputType: OutputType) {
     setNotice("");
     try {
@@ -904,6 +1015,11 @@ export default function App() {
             disabled={running}
           >{arenaTypeLabel(outputType)}</button>)}
         </nav>
+        <SystemPromptControl
+          outputType={config.activeArenaType}
+          systemPrompt={config.systemPrompts?.[config.activeArenaType]}
+          onSave={(value) => saveSystemPrompt(config.activeArenaType, value)}
+        />
       </div>
       <section className="prompt-card" aria-label="提示词输入">
         {config.activeArenaType === "audio_to_text" ? (
@@ -1024,7 +1140,10 @@ export default function App() {
                 >
                   {model.displayName}
                 </h2>
-                <span className={`status status-${status}`}>{statusText}</span>
+                <span className={`status status-${status}`}>
+                  <i className="status-dot" aria-hidden="true" />
+                  {statusText}
+                </span>
               </header>
               <div className="result-content">
                 {result?.outputText && <p>{result.outputText}</p>}
@@ -1078,7 +1197,7 @@ export default function App() {
                       >{label}</button>
                     ))}
                   </div>
-                  {!!availableProviders.length && <div className="source-filters" role="group" aria-label="来源筛选">
+                  {sourceFilterActive && <div className="source-filters" role="group" aria-label="来源筛选">
                     {availableProviders.map((providerKind) => <label key={providerKind}>
                       <input
                         type="checkbox"

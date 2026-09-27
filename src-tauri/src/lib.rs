@@ -3,7 +3,7 @@ use futures_util::future::join_all;
 use reqwest::{Client, StatusCode, Url};
 use serde::{Deserialize, Serialize};
 use std::{
-    collections::{HashMap, hash_map::DefaultHasher},
+    collections::{BTreeMap, HashMap, hash_map::DefaultHasher},
     fs::{self, OpenOptions},
     hash::{Hash, Hasher},
     io::Write,
@@ -53,6 +53,8 @@ struct AppConfig {
     schema_version: u32,
     active_arena_type: String,
     connections: Vec<Connection>,
+    #[serde(default)]
+    system_prompts: BTreeMap<String, String>,
 }
 
 impl Default for AppConfig {
@@ -61,6 +63,7 @@ impl Default for AppConfig {
             schema_version: SCHEMA_VERSION,
             active_arena_type: "text".into(),
             connections: vec![],
+            system_prompts: BTreeMap::new(),
         }
     }
 }
@@ -456,12 +459,25 @@ fn speech_request_body(
     })
 }
 
-fn chat_audio_request_body(model_id: &str, prompt: &str, voice: &str) -> serde_json::Value {
+fn chat_audio_request_body(
+    model_id: &str,
+    prompt: &str,
+    voice: &str,
+    system_prompt: Option<&str>,
+) -> serde_json::Value {
+    let mut messages = Vec::new();
+    if let Some(system_prompt) = system_prompt
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    {
+        messages.push(serde_json::json!({"role": "system", "content": system_prompt}));
+    }
+    messages.push(serde_json::json!({"role": "user", "content": prompt}));
     serde_json::json!({
         "model": model_id,
         "modalities": ["text", "audio"],
         "audio": {"voice": voice, "format": "wav"},
-        "messages": [{"role": "user", "content": prompt}],
+        "messages": messages,
         "stream": false
     })
 }
@@ -886,14 +902,34 @@ fn provider_error(status: StatusCode, body: &str) -> AppError {
     error.status(status)
 }
 
+fn merge_system_prompt(system_prompt: &Option<String>, prompt: &str) -> String {
+    match system_prompt
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    {
+        Some(system_prompt) => format!("{system_prompt}\n\n{prompt}"),
+        None => prompt.to_string(),
+    }
+}
+
 fn chat_request_body(
     model_id: &str,
     content: serde_json::Value,
     max_tokens: Option<u32>,
+    system_prompt: Option<&str>,
 ) -> serde_json::Value {
+    let mut messages = Vec::new();
+    if let Some(system_prompt) = system_prompt
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    {
+        messages.push(serde_json::json!({"role": "system", "content": system_prompt}));
+    }
+    messages.push(serde_json::json!({"role": "user", "content": content}));
     let mut body = serde_json::json!({
         "model": model_id,
-        "messages": [{"role": "user", "content": content}],
+        "messages": messages,
         "stream": false
     });
     if model_id.to_ascii_lowercase().contains("qwen") {
@@ -1026,6 +1062,7 @@ async fn generate_text(
     model_id: String,
     prompt: String,
     reference_image: Option<String>,
+    system_prompt: Option<String>,
     cancellation: CancellationToken,
 ) -> AppResult<GeneratedText> {
     let content = reference_image.map_or_else(
@@ -1040,7 +1077,12 @@ async fn generate_text(
     let request = http_client()?
         .post(chat_endpoint(base_url))
         .bearer_auth(api_key)
-        .json(&chat_request_body(&model_id, content, None))
+        .json(&chat_request_body(
+            &model_id,
+            content,
+            None,
+            system_prompt.as_deref(),
+        ))
         .send();
     let response = tokio::select! {
         _ = cancellation.cancelled() => return Err(AppError::new("CANCELLED", "本次运行已结束。", false)),
@@ -1312,6 +1354,7 @@ async fn generate_audio(
     api_key: String,
     model_id: String,
     prompt: String,
+    system_prompt: Option<String>,
     voice: String,
     cancellation: CancellationToken,
 ) -> AppResult<GeneratedMedia> {
@@ -1319,7 +1362,12 @@ async fn generate_audio(
         let request = http_client()?
             .post(chat_endpoint(base_url))
             .bearer_auth(api_key)
-            .json(&chat_audio_request_body(&model_id, &prompt, &voice))
+            .json(&chat_audio_request_body(
+                &model_id,
+                &prompt,
+                &voice,
+                system_prompt.as_deref(),
+            ))
             .send();
         let response = tokio::select! {
             _ = cancellation.cancelled() => return Err(AppError::new("CANCELLED", "本次运行已结束。", false)),
@@ -1415,6 +1463,7 @@ async fn transcribe_audio(
     api_key: String,
     model_id: String,
     audio_input: String,
+    system_prompt: Option<String>,
     cancellation: CancellationToken,
 ) -> AppResult<GeneratedText> {
     let (header, encoded) = audio_input
@@ -1440,14 +1489,20 @@ async fn transcribe_audio(
         .file_name(file_name)
         .mime_str(mime)
         .map_err(|_| AppError::new("VALIDATION_ERROR", "音频格式不受支持。", false))?;
+    let mut form = reqwest::multipart::Form::new()
+        .text("model", model_id)
+        .part("file", part);
+    if let Some(system_prompt) = system_prompt
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    {
+        form = form.text("prompt", system_prompt.to_string());
+    }
     let request = http_client()?
         .post(transcription_endpoint(base_url))
         .bearer_auth(api_key)
-        .multipart(
-            reqwest::multipart::Form::new()
-                .text("model", model_id)
-                .part("file", part),
-        )
+        .multipart(form)
         .send();
     let response = tokio::select! {
         _ = cancellation.cancelled() => return Err(AppError::new("CANCELLED", "本次运行已结束。", false)),
@@ -1835,6 +1890,26 @@ fn arena_type_set(output_type: String, state: State<'_, AppState>) -> AppResult<
     Ok(config)
 }
 
+#[tauri::command]
+fn system_prompt_set(
+    output_type: String,
+    system_prompt: String,
+    state: State<'_, AppState>,
+) -> AppResult<AppConfig> {
+    validate_output_type(&output_type)?;
+    let mut config = load_config(&state.config_path)?;
+    let trimmed = system_prompt.trim();
+    if trimmed.is_empty() {
+        config.system_prompts.remove(&output_type);
+    } else {
+        config
+            .system_prompts
+            .insert(output_type, trimmed.to_string());
+    }
+    save_config(&state.config_path, &config)?;
+    Ok(config)
+}
+
 async fn fetch_catalog(
     client: &Client,
     endpoint: Url,
@@ -1913,6 +1988,7 @@ async fn validate_integrated_key(
             model_id,
             serde_json::Value::String("1".into()),
             Some(1),
+            None,
         ))
         .send()
         .await
@@ -1940,6 +2016,7 @@ async fn probe_text_model(
             &model_id,
             serde_json::Value::String("1".into()),
             Some(1),
+            None,
         ))
         .send()
         .await
@@ -2144,6 +2221,7 @@ async fn connection_test(
                 key.clone(),
                 model_id.to_string(),
                 "连接成功".into(),
+                None,
                 "alloy".into(),
                 CancellationToken::new(),
             )
@@ -2158,6 +2236,7 @@ async fn connection_test(
                 input.audio_input.ok_or_else(|| {
                     AppError::new("VALIDATION_ERROR", "请添加一段测试音频。", false)
                 })?,
+                None,
                 CancellationToken::new(),
             )
             .await?;
@@ -2170,6 +2249,7 @@ async fn connection_test(
             key.clone(),
             model_id.to_string(),
             CONNECTION_TEST_PROMPT.into(),
+            None,
             None,
             CancellationToken::new(),
         )
@@ -2581,6 +2661,12 @@ fn text_run_start(
     let prompt = prompt.trim().to_string();
     let config = load_config(&state.config_path)?;
     let active_output_type = config.active_arena_type.clone();
+    let system_prompt = config
+        .system_prompts
+        .get(&active_output_type)
+        .map(|value| value.trim())
+        .filter(|value| !value.is_empty())
+        .map(str::to_string);
     if active_output_type == "audio_to_text" {
         if audio_input.is_none() {
             return Err(AppError::new(
@@ -2656,6 +2742,7 @@ fn text_run_start(
             let app = app.clone();
             let prompt = prompt.clone();
             let reference_image = reference_image.clone();
+            let system_prompt = system_prompt.clone();
             let audio_input = audio_input.clone();
             let image_ratio = image_ratio.clone().unwrap_or_else(|| "1:1".into());
             let audio_voice = audio_voice.clone().unwrap_or_else(|| "alloy".into());
@@ -2676,7 +2763,7 @@ fn text_run_start(
                             base_url: target.base_url,
                             api_key: target.api_key,
                             model_id: target.model_id,
-                            prompt,
+                            prompt: merge_system_prompt(&system_prompt, &prompt),
                             reference_image,
                             image_ratio,
                         },
@@ -2696,6 +2783,7 @@ fn text_run_start(
                         target.api_key,
                         target.model_id,
                         prompt,
+                        system_prompt.clone(),
                         audio_voice,
                         cancellation,
                     )
@@ -2712,6 +2800,7 @@ fn text_run_start(
                         target.api_key,
                         target.model_id,
                         audio_input.unwrap_or_default(),
+                        system_prompt.clone(),
                         cancellation,
                     )
                     .await
@@ -2728,7 +2817,7 @@ fn text_run_start(
                             base_url: target.base_url,
                             api_key: target.api_key,
                             model_id: target.model_id,
-                            prompt,
+                            prompt: merge_system_prompt(&system_prompt, &prompt),
                             reference_image,
                             ratio: image_ratio,
                             seconds: video_seconds,
@@ -2750,6 +2839,7 @@ fn text_run_start(
                         target.model_id,
                         prompt,
                         reference_image,
+                        system_prompt,
                         cancellation,
                     )
                     .await
@@ -2892,6 +2982,7 @@ pub fn run() {
             connection_test,
             connection_save,
             arena_type_set,
+            system_prompt_set,
             model_set_enabled,
             model_remove,
             models_clear,
@@ -3097,12 +3188,52 @@ mod tests {
     }
 
     #[test]
+    fn merges_system_prompt_into_media_prompts() {
+        let system = Some("保持冷色调".to_string());
+        assert_eq!(merge_system_prompt(&system, "一只猫"), "保持冷色调\n\n一只猫");
+        assert_eq!(merge_system_prompt(&Some("   ".into()), "一只猫"), "一只猫");
+        assert_eq!(merge_system_prompt(&None, "一只猫"), "一只猫");
+    }
+
+    #[test]
+    fn round_trips_system_prompts_per_arena_type() {
+        let mut config = AppConfig::default();
+        config.system_prompts.insert("text".into(), "先给结论".into());
+        config.system_prompts.insert("image".into(), "冷色调".into());
+        let encoded = serde_json::to_vec(&config).expect("config should serialize");
+        let parsed = parse_config(&encoded).expect("config should parse");
+        assert_eq!(
+            parsed.system_prompts.get("text").map(String::as_str),
+            Some("先给结论")
+        );
+        assert_eq!(
+            parsed.system_prompts.get("image").map(String::as_str),
+            Some("冷色调")
+        );
+
+        let legacy = br#"{"schemaVersion":1,"activeArenaType":"text","connections":[]}"#;
+        assert!(parse_config(legacy)
+            .expect("旧配置也要能解析")
+            .system_prompts
+            .is_empty());
+    }
+
+    #[test]
     fn supports_aihubmix_chat_audio_models() {
         assert!(uses_chat_audio_endpoint("aihubmix", "gpt-4o-audio-preview"));
         assert!(!uses_chat_audio_endpoint("aihubmix", "gpt-4o-mini-tts"));
-        let body = chat_audio_request_body("gpt-4o-audio-preview", "hello", "nova");
+        let body = chat_audio_request_body("gpt-4o-audio-preview", "hello", "nova", Some("只读数字"));
         assert_eq!(body["modalities"], serde_json::json!(["text", "audio"]));
         assert_eq!(body["audio"]["voice"], "nova");
+        assert_eq!(body["messages"][0]["role"], "system");
+        assert_eq!(body["messages"][0]["content"], "只读数字");
+        assert_eq!(body["messages"][1]["role"], "user");
+        assert_eq!(
+            chat_audio_request_body("gpt-4o-audio-preview", "hello", "nova", None)["messages"]
+                .as_array()
+                .map(Vec::len),
+            Some(1)
+        );
 
         let output = parse_chat_audio_response(serde_json::json!({
             "choices": [{"message": {"audio": {"data": "YWJj"}}}]
@@ -3142,6 +3273,7 @@ mod tests {
         let mut config = AppConfig {
             schema_version: SCHEMA_VERSION,
             active_arena_type: "text".into(),
+            system_prompts: BTreeMap::new(),
             connections: vec![Connection {
                 id: "connection".into(),
                 display_name: "test".into(),
@@ -3178,6 +3310,7 @@ mod tests {
         let mut config = AppConfig {
             schema_version: SCHEMA_VERSION,
             active_arena_type: "text".into(),
+            system_prompts: BTreeMap::new(),
             connections: Vec::new(),
         };
         activate_output_type(&mut config, "video");
@@ -3197,6 +3330,7 @@ mod tests {
         let mut config = AppConfig {
             schema_version: SCHEMA_VERSION,
             active_arena_type: "text".into(),
+            system_prompts: BTreeMap::new(),
             connections: vec![
                 Connection {
                     id: "first".into(),
@@ -3268,6 +3402,7 @@ mod tests {
         let mut config = AppConfig {
             schema_version: SCHEMA_VERSION,
             active_arena_type: "text".into(),
+            system_prompts: BTreeMap::new(),
             connections: vec![
                 connection("aihubmix", "aihubmix", vec![model("gpt", "text")]),
                 connection(
@@ -3292,6 +3427,7 @@ mod tests {
         let mut config = AppConfig {
             schema_version: SCHEMA_VERSION,
             active_arena_type: "text".into(),
+            system_prompts: BTreeMap::new(),
             connections: vec![Connection {
                 id: "connection".into(),
                 display_name: "AIHubMix".into(),
@@ -3399,11 +3535,43 @@ mod tests {
 
     #[test]
     fn disables_qwen_thinking_for_non_streaming_requests() {
-        let qwen = chat_request_body("qwen3-14b", serde_json::Value::String("hi".into()), None);
+        let qwen = chat_request_body(
+            "qwen3-14b",
+            serde_json::Value::String("hi".into()),
+            None,
+            None,
+        );
         assert_eq!(qwen["enable_thinking"], false);
 
-        let other = chat_request_body("gpt-5", serde_json::Value::String("hi".into()), None);
+        let other = chat_request_body(
+            "gpt-5",
+            serde_json::Value::String("hi".into()),
+            None,
+            None,
+        );
         assert!(other.get("enable_thinking").is_none());
+    }
+
+    #[test]
+    fn prepends_system_prompt_message() {
+        let with_prompt = chat_request_body(
+            "gpt-5",
+            serde_json::Value::String("hi".into()),
+            None,
+            Some("  你是审稿人  "),
+        );
+        assert_eq!(with_prompt["messages"][0]["role"], "system");
+        assert_eq!(with_prompt["messages"][0]["content"], "你是审稿人");
+        assert_eq!(with_prompt["messages"][1]["role"], "user");
+
+        let blank_prompt = chat_request_body(
+            "gpt-5",
+            serde_json::Value::String("hi".into()),
+            None,
+            Some("   "),
+        );
+        assert_eq!(blank_prompt["messages"].as_array().map(Vec::len), Some(1));
+        assert_eq!(blank_prompt["messages"][0]["role"], "user");
     }
 
     #[test]
@@ -3427,6 +3595,7 @@ mod tests {
         let mut config = AppConfig {
             schema_version: SCHEMA_VERSION,
             active_arena_type: "text".into(),
+            system_prompts: BTreeMap::new(),
             connections: vec![Connection {
                 id: "siliconflow".into(),
                 display_name: "硅基流动".into(),
