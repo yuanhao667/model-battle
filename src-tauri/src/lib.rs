@@ -139,6 +139,9 @@ struct RunInput {
     image_ratio: Option<String>,
     audio_voice: Option<String>,
     video_seconds: Option<String>,
+    /// 只重跑指定模型（卡片上的“重新生成”），缺省则跑当前类型的全部启用模型。
+    #[serde(default)]
+    model_config_ids: Option<Vec<String>>,
 }
 
 #[derive(Serialize)]
@@ -181,9 +184,15 @@ struct CatalogOption {
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase")]
 struct Usage {
+    #[serde(skip_serializing_if = "Option::is_none")]
     input_tokens: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     output_tokens: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     total_tokens: Option<u64>,
+    /// 推理模型「思考」消耗的 token，包含在 output_tokens 里。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    reasoning_tokens: Option<u64>,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -194,6 +203,9 @@ struct ModelRunFinished {
     status: &'static str,
     #[serde(skip_serializing_if = "Option::is_none")]
     output_text: Option<String>,
+    /// 推理模型的思考过程，只在流式输出时会带上。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    output_reasoning: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     output_image: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -201,10 +213,24 @@ struct ModelRunFinished {
     #[serde(skip_serializing_if = "Option::is_none")]
     output_video: Option<String>,
     elapsed_ms: u64,
+    /// 从发出请求到收到第一个字的耗时，非流式或没有输出时为 None。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    first_token_ms: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     usage: Option<Usage>,
     #[serde(skip_serializing_if = "Option::is_none")]
     error: Option<AppError>,
+}
+
+/// 流式输出时按批推送给界面的增量内容。
+#[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct ModelTextDelta {
+    run_id: String,
+    model_config_id: String,
+    content: String,
+    reasoning: String,
+    elapsed_ms: u64,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -336,9 +362,13 @@ fn models_endpoint(provider_kind: &str, output_type: &str, mut base: Url) -> Url
         base.set_path(&path);
     }
     if provider_kind == "siliconflow" {
+        // 平台的音频模型列表把语音识别和语音合成混在一起，只有 text-to-speech 才是能合成的。
         if output_type == "audio_to_text" {
             base.query_pairs_mut()
                 .append_pair("sub_type", "speech-to-text");
+        } else if output_type == "audio" {
+            base.query_pairs_mut()
+                .append_pair("sub_type", "text-to-speech");
         } else {
             base.query_pairs_mut().append_pair("type", output_type);
         }
@@ -418,24 +448,20 @@ fn speech_request_body(
     response_format: &str,
 ) -> serde_json::Value {
     let model_lower = model_id.to_ascii_lowercase();
+    let is_semantic_voice = matches!(voice, "alloy" | "echo" | "fable" | "onyx" | "nova" | "shimmer");
     let (input, voice) = if provider_kind == "siliconflow" {
-        let voice = match voice {
-            "echo" => "alex",
-            "fable" => "claire",
-            "onyx" => "benjamin",
-            "nova" => "diana",
-            "shimmer" => "bella",
-            _ => "anna",
-        };
-        let input = if model_id.to_ascii_lowercase().contains("moss-ttsd")
-            && !prompt.trim_start().starts_with("[S1]")
-        {
+        let input = if model_lower.contains("moss-ttsd") && !prompt.trim_start().starts_with("[S1]") {
             format!("[S1]{prompt}")
         } else {
             prompt.to_string()
         };
+        // 硅基流动的格式是“模型名:音色名”，界面给的就是平台真实的音色名。
         (input, format!("{model_id}:{voice}"))
-    } else if provider_kind == "aihubmix" && model_lower.contains("qwen-audio-3.0-tts") {
+    } else if provider_kind == "aihubmix"
+        && model_lower.contains("qwen-audio-3.0-tts")
+        && is_semantic_voice
+    {
+        // 旧版本用 OpenAI 音色名占位，这里保持兼容；新版本直接传平台真实音色名。
         let voice = if model_lower.contains("plus") {
             match voice {
                 "echo" | "onyx" => "longanlufeng",
@@ -652,6 +678,29 @@ fn migrate_legacy_model_types(config: &mut AppConfig) -> bool {
     changed
 }
 
+fn is_speech_recognition_model(model_id: &str) -> bool {
+    let normalized = model_id.to_ascii_lowercase();
+    ["asr", "sensevoice", "whisper", "gsr"]
+        .iter()
+        .any(|keyword| normalized.contains(keyword))
+}
+
+/// 早期版本的模型目录把硅基流动的语音识别模型放进了“文本转音频”，
+/// 那些模型没法合成语音，这里按模型名把它们移回“音频转文本”。
+fn reclassify_speech_recognition_models(config: &mut AppConfig) -> bool {
+    let mut changed = false;
+    for connection in &mut config.connections {
+        for model in &mut connection.models {
+            if model.output_type == "audio" && is_speech_recognition_model(&model.model_id) {
+                model.output_type = "audio_to_text".into();
+                model.supports_reference_image = false;
+                changed = true;
+            }
+        }
+    }
+    changed
+}
+
 fn keep_latest_platform_connections(config: &mut AppConfig) -> bool {
     let mut changed = false;
     for provider_kind in ["aihubmix", "siliconflow"] {
@@ -683,6 +732,7 @@ fn load_config(path: &Path) -> AppResult<AppConfig> {
     match primary {
         Ok(mut config) => {
             if migrate_legacy_model_types(&mut config)
+                | reclassify_speech_recognition_models(&mut config)
                 | keep_latest_platform_connections(&mut config)
             {
                 save_config(path, &config)?;
@@ -697,6 +747,7 @@ fn load_config(path: &Path) -> AppResult<AppConfig> {
             let bytes = fs::read(&backup).map_err(|_| primary_error.clone())?;
             let mut restored = parse_config(&bytes)?;
             migrate_legacy_model_types(&mut restored);
+            reclassify_speech_recognition_models(&mut restored);
             keep_latest_platform_connections(&mut restored);
             fs::remove_file(path).map_err(|_| primary_error)?;
             save_config(path, &restored)?;
@@ -956,6 +1007,63 @@ fn provider_error_detail(body: &str) -> Option<String> {
     (!detail.is_empty()).then(|| detail.chars().take(240).collect())
 }
 
+/// 各类请求的兜底超时：宁可明确报“已超时”，也不要一直转圈等下去。
+const TEXT_TIMEOUT: Duration = Duration::from_secs(300);
+/// 连接验证只需要模型回一句话，不用等满文本生成的上限。
+const CONNECTION_TEST_TIMEOUT: Duration = Duration::from_secs(30);
+/// 流式输出时，多久收不到新内容就判定卡死。
+const TEXT_STREAM_STALL_TIMEOUT: Duration = Duration::from_secs(60);
+const IMAGE_TIMEOUT: Duration = Duration::from_secs(180);
+const SPEECH_TIMEOUT: Duration = Duration::from_secs(120);
+const TRANSCRIBE_TIMEOUT: Duration = Duration::from_secs(180);
+const VIDEO_SUBMIT_TIMEOUT: Duration = Duration::from_secs(60);
+const VIDEO_POLL_TIMEOUT: Duration = Duration::from_secs(30);
+/// 视频是异步任务，整体等待上限（含排队和生成）。
+const VIDEO_TASK_TIMEOUT: Duration = Duration::from_secs(600);
+const MEDIA_DOWNLOAD_TIMEOUT: Duration = Duration::from_secs(120);
+
+/// 人类可读的时长，例如 60 秒 / 2 分钟 / 10 分钟 / 2 分 30 秒。
+fn human_duration(limit: Duration) -> String {
+    let seconds = limit.as_secs();
+    if seconds < 120 {
+        return format!("{seconds} 秒");
+    }
+    if seconds % 60 == 0 {
+        return format!("{} 分钟", seconds / 60);
+    }
+    format!("{} 分 {} 秒", seconds / 60, seconds % 60)
+}
+
+fn timeout_error(what: &str, limit: Duration) -> AppError {
+    AppError::new(
+        "MODEL_TIMEOUT",
+        format!(
+            "已超时：{what}超过 {} 仍未完成，已停止等待。可以稍后重试或更换更快的模型。",
+            human_duration(limit)
+        ),
+        true,
+    )
+}
+
+fn stream_stall_error(limit: Duration) -> AppError {
+    AppError::new(
+        "MODEL_TIMEOUT",
+        format!(
+            "已超时：{} 内没有收到新的内容，已停止等待。可以稍后重试或更换更快的模型。",
+            human_duration(limit)
+        ),
+        true,
+    )
+}
+
+/// 把 reqwest 的超时错误换成带明确时长的提示，其他错误照旧按连接问题处理。
+fn request_error(error: &reqwest::Error, target: &str, what: &str, limit: Duration) -> AppError {
+    if error.is_timeout() {
+        return timeout_error(what, limit);
+    }
+    connection_error(error, target)
+}
+
 fn http_client() -> AppResult<Client> {
     Client::builder()
         .connect_timeout(Duration::from_secs(8))
@@ -994,12 +1102,18 @@ struct OpenAiChoice {
 #[derive(Deserialize)]
 struct OpenAiMessage {
     content: Option<String>,
+    reasoning_content: Option<String>,
+}
+#[derive(Deserialize)]
+struct OpenAiUsageDetails {
+    reasoning_tokens: Option<u64>,
 }
 #[derive(Deserialize)]
 struct OpenAiUsage {
     prompt_tokens: Option<u64>,
     completion_tokens: Option<u64>,
     total_tokens: Option<u64>,
+    completion_tokens_details: Option<OpenAiUsageDetails>,
 }
 #[derive(Deserialize)]
 struct CatalogResponse {
@@ -1016,7 +1130,9 @@ struct CatalogModel {
 #[derive(Debug)]
 struct GeneratedText {
     text: String,
+    reasoning: Option<String>,
     usage: Option<Usage>,
+    first_token_ms: Option<u64>,
 }
 
 #[derive(Debug)]
@@ -1060,6 +1176,178 @@ struct VideoGenerationRequest {
     output_path: PathBuf,
 }
 
+/// 把模型增量推给界面的通道；`None` 表示走原来的非流式请求（比如连接验证）。
+#[derive(Clone)]
+struct DeltaSink {
+    app: tauri::AppHandle,
+    run_id: String,
+    model_config_id: String,
+    /// 本次模型调用的起始时刻，用于计算首字延迟。
+    started: Instant,
+}
+
+/// 流式输出时每积累这么多字符、或间隔这么久，就推一批给界面。
+const DELTA_BATCH_CHARS: usize = 24;
+const DELTA_BATCH_INTERVAL: Duration = Duration::from_millis(80);
+
+#[derive(Default)]
+struct ChatStreamState {
+    content: String,
+    reasoning: String,
+    usage: Option<Usage>,
+    first_token_ms: Option<u64>,
+    saw_event: bool,
+}
+
+fn stream_request_body(body: &mut serde_json::Value) {
+    body["stream"] = serde_json::Value::Bool(true);
+    // 让服务商在最后一段返回 token 用量，界面才能算出准确的速度。
+    body["stream_options"] = serde_json::json!({ "include_usage": true });
+}
+
+fn usage_from_value(value: &serde_json::Value) -> Option<Usage> {
+    let usage: OpenAiUsage = serde_json::from_value(value.clone()).ok()?;
+    (usage.prompt_tokens.is_some()
+        || usage.completion_tokens.is_some()
+        || usage.total_tokens.is_some())
+    .then(|| openai_usage(usage))
+}
+
+/// 解析一行 SSE，返回本次新增的（正文, 思考）内容。
+fn apply_stream_line(
+    state: &mut ChatStreamState,
+    line: &str,
+    started: Instant,
+) -> Option<(String, String)> {
+    let data = line.trim_start().strip_prefix("data:")?.trim();
+    if data.is_empty() {
+        return None;
+    }
+    state.saw_event = true;
+    if data == "[DONE]" {
+        return None;
+    }
+    let value: serde_json::Value = serde_json::from_str(data).ok()?;
+    if let Some(usage) = value.get("usage").and_then(usage_from_value) {
+        state.usage = Some(usage);
+    }
+    let delta = value.pointer("/choices/0/delta")?;
+    let content = delta
+        .get("content")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or_default()
+        .to_string();
+    let reasoning = delta
+        .get("reasoning_content")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or_default()
+        .to_string();
+    if content.is_empty() && reasoning.is_empty() {
+        return None;
+    }
+    if state.first_token_ms.is_none() {
+        state.first_token_ms = Some(started.elapsed().as_millis() as u64);
+    }
+    state.content.push_str(&content);
+    state.reasoning.push_str(&reasoning);
+    Some((content, reasoning))
+}
+
+async fn read_text_stream(
+    mut response: reqwest::Response,
+    sink: DeltaSink,
+    cancellation: CancellationToken,
+) -> AppResult<GeneratedText> {
+    let started = sink.started;
+    let mut state = ChatStreamState::default();
+    let mut buffer = String::new();
+    // 只有还没看到任何 SSE 事件时才留原始响应，用于兼容不支持流式的服务商。
+    let mut raw = String::new();
+    let mut pending_content = String::new();
+    let mut pending_reasoning = String::new();
+    let mut last_emit = Instant::now();
+
+    loop {
+        if started.elapsed() >= TEXT_TIMEOUT {
+            return Err(timeout_error("文本生成", TEXT_TIMEOUT));
+        }
+        let Some(bytes) = next_stream_chunk(&mut response, TEXT_STREAM_STALL_TIMEOUT, &cancellation).await? else {
+            break;
+        };
+        let text = String::from_utf8_lossy(&bytes).into_owned();
+        if !state.saw_event {
+            raw.push_str(&text);
+        }
+        buffer.push_str(&text);
+        while let Some(index) = buffer.find('\n') {
+            let line: String = buffer.drain(..=index).collect();
+            if let Some((content, reasoning)) =
+                apply_stream_line(&mut state, line.trim_end_matches(['\r', '\n']), started)
+            {
+                pending_content.push_str(&content);
+                pending_reasoning.push_str(&reasoning);
+            }
+        }
+        if pending_content.len() + pending_reasoning.len() >= DELTA_BATCH_CHARS
+            || last_emit.elapsed() >= DELTA_BATCH_INTERVAL
+        {
+            emit_delta(&sink, &mut pending_content, &mut pending_reasoning);
+            last_emit = Instant::now();
+        }
+    }
+    emit_delta(&sink, &mut pending_content, &mut pending_reasoning);
+
+    if !state.content.is_empty() {
+        return Ok(GeneratedText {
+            text: state.content,
+            reasoning: (!state.reasoning.is_empty()).then(|| state.reasoning),
+            usage: state.usage,
+            first_token_ms: state.first_token_ms,
+        });
+    }
+    // 个别服务商忽略 stream 参数，直接返回整段 JSON，这里兼容掉。
+    if let Ok(body) = serde_json::from_str::<OpenAiResponse>(&raw) {
+        return parse_openai_response(body);
+    }
+    Err(AppError::new(
+        "RESPONSE_INVALID",
+        "模型没有返回可展示的文本。",
+        false,
+    ))
+}
+
+/// 取下一段 SSE 数据：超过 limit 还没数据就报“已超时”，返回 None 表示流正常结束。
+async fn next_stream_chunk(
+    response: &mut reqwest::Response,
+    limit: Duration,
+    cancellation: &CancellationToken,
+) -> AppResult<Option<Vec<u8>>> {
+    tokio::select! {
+        _ = cancellation.cancelled() => Err(AppError::new("CANCELLED", "本次运行已结束。", false)),
+        result = tokio::time::timeout(limit, response.chunk()) => match result {
+            Err(_) => Err(stream_stall_error(limit)),
+            Ok(Err(error)) => Err(request_error(&error, "模型接口", "文本生成", TEXT_TIMEOUT)),
+            Ok(Ok(chunk)) => Ok(chunk.map(|bytes| bytes.to_vec())),
+        },
+    }
+}
+
+fn emit_delta(sink: &DeltaSink, pending_content: &mut String, pending_reasoning: &mut String) {
+    if pending_content.is_empty() && pending_reasoning.is_empty() {
+        return;
+    }
+    let _ = sink.app.emit(
+        "text-model-delta",
+        ModelTextDelta {
+            run_id: sink.run_id.clone(),
+            model_config_id: sink.model_config_id.clone(),
+            content: std::mem::take(pending_content),
+            reasoning: std::mem::take(pending_reasoning),
+            elapsed_ms: sink.started.elapsed().as_millis() as u64,
+        },
+    );
+}
+
 async fn generate_text(
     base_url: Url,
     api_key: String,
@@ -1068,6 +1356,7 @@ async fn generate_text(
     reference_image: Option<String>,
     system_prompt: Option<String>,
     cancellation: CancellationToken,
+    sink: Option<DeltaSink>,
 ) -> AppResult<GeneratedText> {
     let content = reference_image.map_or_else(
         || serde_json::Value::String(prompt.clone()),
@@ -1078,30 +1367,42 @@ async fn generate_text(
             ])
         },
     );
-    let request = http_client()?
+    let mut body = chat_request_body(&model_id, content, None, system_prompt.as_deref());
+    if sink.is_some() {
+        stream_request_body(&mut body);
+    }
+    let mut builder = http_client()?
         .post(chat_endpoint(base_url))
         .bearer_auth(api_key)
-        .json(&chat_request_body(
-            &model_id,
-            content,
-            None,
-            system_prompt.as_deref(),
-        ))
-        .send();
+        .json(&body);
+    // 流式输出由 read_text_stream 用“空闲时长 + 整体上限”分别兜底；
+    // 非流式只用于连接验证，给一个更短的兜底时长。
+    let (request_limit, what) = if sink.is_none() {
+        builder = builder.timeout(CONNECTION_TEST_TIMEOUT);
+        (CONNECTION_TEST_TIMEOUT, "连接测试")
+    } else {
+        (TEXT_TIMEOUT, "文本生成")
+    };
+    let request = builder.send();
     let response = tokio::select! {
         _ = cancellation.cancelled() => return Err(AppError::new("CANCELLED", "本次运行已结束。", false)),
-        response = request => response.map_err(|error| connection_error(&error, "模型接口"))?,
+        response = request => response.map_err(|error| request_error(&error, "模型接口", what, request_limit))?,
     };
     let status = response.status();
     if !status.is_success() {
         let body = response.text().await.unwrap_or_default();
         return Err(provider_error(status, &body));
     }
-    let body: OpenAiResponse = response
-        .json()
-        .await
-        .map_err(|_| AppError::new("RESPONSE_INVALID", "模型返回了无法识别的数据。", false))?;
-    parse_openai_response(body)
+    match sink {
+        Some(sink) => read_text_stream(response, sink, cancellation).await,
+        None => {
+            let body: OpenAiResponse = response
+                .json()
+                .await
+                .map_err(|_| AppError::new("RESPONSE_INVALID", "模型返回了无法识别的数据。", false))?;
+            parse_openai_response(body)
+        }
+    }
 }
 
 async fn generate_image(
@@ -1141,11 +1442,12 @@ async fn generate_image(
     let request = http_client()?
         .post(image_endpoint(input.base_url))
         .bearer_auth(input.api_key)
+        .timeout(IMAGE_TIMEOUT)
         .json(&body)
         .send();
     let response = tokio::select! {
         _ = cancellation.cancelled() => return Err(AppError::new("CANCELLED", "本次运行已结束。", false)),
-        response = request => response.map_err(|error| connection_error(&error, "图片模型接口"))?,
+        response = request => response.map_err(|error| request_error(&error, "图片模型接口", "图片生成", IMAGE_TIMEOUT))?,
     };
     let status = response.status();
     if !status.is_success() {
@@ -1198,7 +1500,7 @@ async fn generate_aihubmix_image(
         .send();
     let response = tokio::select! {
         _ = cancellation.cancelled() => return Err(AppError::new("CANCELLED", "本次运行已结束。", false)),
-        response = request => response.map_err(|error| connection_error(&error, "AIHubMix 图片模型接口"))?,
+        response = request => response.map_err(|error| request_error(&error, "AIHubMix 图片模型接口", "图片生成", IMAGE_TIMEOUT))?,
     };
     let status = response.status();
     if !status.is_success() {
@@ -1240,11 +1542,12 @@ async fn generate_aihubmix_gemini_image(
         .post(aihubmix_gemini_endpoint(input.base_url, &input.model_id))
         .header("x-goog-api-key", &input.api_key)
         .bearer_auth(&input.api_key)
+        .timeout(IMAGE_TIMEOUT)
         .json(&body)
         .send();
     let response = tokio::select! {
         _ = cancellation.cancelled() => return Err(AppError::new("CANCELLED", "本次运行已结束。", false)),
-        response = request => response.map_err(|error| connection_error(&error, "AIHubMix Gemini 生图接口"))?,
+        response = request => response.map_err(|error| request_error(&error, "AIHubMix Gemini 生图接口", "图片生成", IMAGE_TIMEOUT))?,
     };
     let status = response.status();
     if !status.is_success() {
@@ -1318,6 +1621,7 @@ fn parse_image_response(body: serde_json::Value) -> AppResult<GeneratedImage> {
                 input_tokens,
                 output_tokens,
                 total_tokens,
+                reasoning_tokens: None,
             },
         )
     });
@@ -1366,6 +1670,7 @@ async fn generate_audio(
         let request = http_client()?
             .post(chat_endpoint(base_url))
             .bearer_auth(api_key)
+            .timeout(SPEECH_TIMEOUT)
             .json(&chat_audio_request_body(
                 &model_id,
                 &prompt,
@@ -1375,7 +1680,7 @@ async fn generate_audio(
             .send();
         let response = tokio::select! {
             _ = cancellation.cancelled() => return Err(AppError::new("CANCELLED", "本次运行已结束。", false)),
-            response = request => response.map_err(|error| connection_error(&error, "音频生成接口"))?,
+            response = request => response.map_err(|error| request_error(&error, "音频生成接口", "音频合成", SPEECH_TIMEOUT))?,
         };
         let status = response.status();
         if !status.is_success() {
@@ -1396,11 +1701,12 @@ async fn generate_audio(
     let request = http_client()?
         .post(audio_endpoint(base_url))
         .bearer_auth(api_key)
+        .timeout(SPEECH_TIMEOUT)
         .json(&body)
         .send();
     let response = tokio::select! {
         _ = cancellation.cancelled() => return Err(AppError::new("CANCELLED", "本次运行已结束。", false)),
-        response = request => response.map_err(|error| connection_error(&error, "音频生成接口"))?,
+        response = request => response.map_err(|error| request_error(&error, "音频生成接口", "音频合成", SPEECH_TIMEOUT))?,
     };
     let status = response.status();
     if !status.is_success() {
@@ -1421,7 +1727,7 @@ async fn generate_audio(
         let result_url = qwen_audio_result_url(&body).ok_or_else(|| {
             AppError::new("RESPONSE_INVALID", "模型没有返回可下载的音频链接。", false)
         })?;
-        let download = http_client()?.get(result_url).send();
+        let download = http_client()?.get(result_url).timeout(MEDIA_DOWNLOAD_TIMEOUT).send();
         let download = tokio::select! {
             _ = cancellation.cancelled() => return Err(AppError::new("CANCELLED", "本次运行已结束。", false)),
             response = download => response.map_err(|error| connection_error(&error, "音频下载接口"))?,
@@ -1506,11 +1812,12 @@ async fn transcribe_audio(
     let request = http_client()?
         .post(transcription_endpoint(base_url))
         .bearer_auth(api_key)
+        .timeout(TRANSCRIBE_TIMEOUT)
         .multipart(form)
         .send();
     let response = tokio::select! {
         _ = cancellation.cancelled() => return Err(AppError::new("CANCELLED", "本次运行已结束。", false)),
-        response = request => response.map_err(|error| connection_error(&error, "音频转文本接口"))?,
+        response = request => response.map_err(|error| request_error(&error, "音频转文本接口", "音频转写", TRANSCRIBE_TIMEOUT))?,
     };
     let status = response.status();
     if !status.is_success() {
@@ -1534,7 +1841,12 @@ async fn transcribe_audio(
             )
         })?
         .to_string();
-    Ok(GeneratedText { text, usage: None })
+    Ok(GeneratedText {
+        text,
+        reasoning: None,
+        usage: None,
+        first_token_ms: None,
+    })
 }
 
 async fn response_to_file(
@@ -1591,7 +1903,7 @@ async fn download_video(
     }
     let response = tokio::select! {
         _ = cancellation.cancelled() => return Err(AppError::new("CANCELLED", "本次运行已结束。", false)),
-        response = request.send() => response.map_err(|error| connection_error(&error, "视频下载接口"))?,
+        response = request.timeout(MEDIA_DOWNLOAD_TIMEOUT).send() => response.map_err(|error| request_error(&error, "视频下载接口", "结果下载", MEDIA_DOWNLOAD_TIMEOUT))?,
     };
     let status = response.status();
     if !status.is_success() {
@@ -1609,6 +1921,9 @@ async fn generate_siliconflow_video(
     let submit_url = silicon_video_endpoint(input.base_url.clone(), "submit");
     let status_url = silicon_video_endpoint(input.base_url.clone(), "status");
     let mut body = serde_json::json!({
+        // 注意：硅基流动的 /video/submit 只接受 model / prompt / image_size / image，
+        // 没有时长字段（Wan2.2 的时长由平台固定），所以界面上选择的时长只能写进提示词，
+        // 详见前端 applyVideoSecondsTag。
         "model": input.model_id,
         "prompt": input.prompt,
         "image_size": silicon_video_size(&input.ratio)
@@ -1620,8 +1935,8 @@ async fn generate_siliconflow_video(
     }
     let response = tokio::select! {
         _ = cancellation.cancelled() => return Err(AppError::new("CANCELLED", "本次运行已结束。", false)),
-        response = client.post(submit_url).bearer_auth(&input.api_key).json(&body).send() =>
-            response.map_err(|error| connection_error(&error, "硅基流动视频生成接口"))?,
+        response = client.post(submit_url).bearer_auth(&input.api_key).timeout(VIDEO_SUBMIT_TIMEOUT).json(&body).send() =>
+            response.map_err(|error| request_error(&error, "硅基流动视频生成接口", "视频任务提交", VIDEO_SUBMIT_TIMEOUT))?,
     };
     let status = response.status();
     if !status.is_success() {
@@ -1641,15 +1956,19 @@ async fn generate_siliconflow_video(
         .filter(|id| !id.is_empty())
         .ok_or_else(|| AppError::new("RESPONSE_INVALID", "硅基流动没有返回视频任务 ID。", false))?
         .to_string();
+    let task_started = Instant::now();
     loop {
+        if task_started.elapsed() >= VIDEO_TASK_TIMEOUT {
+            return Err(timeout_error("视频生成", VIDEO_TASK_TIMEOUT));
+        }
         tokio::select! {
             _ = cancellation.cancelled() => return Err(AppError::new("CANCELLED", "本次运行已结束。", false)),
             _ = tokio::time::sleep(Duration::from_secs(5)) => {}
         }
         let response = tokio::select! {
             _ = cancellation.cancelled() => return Err(AppError::new("CANCELLED", "本次运行已结束。", false)),
-            response = client.post(status_url.clone()).bearer_auth(&input.api_key).json(&serde_json::json!({"requestId": request_id})).send() =>
-                response.map_err(|error| connection_error(&error, "硅基流动视频任务接口"))?,
+            response = client.post(status_url.clone()).bearer_auth(&input.api_key).timeout(VIDEO_POLL_TIMEOUT).json(&serde_json::json!({"requestId": request_id})).send() =>
+                response.map_err(|error| request_error(&error, "硅基流动视频任务接口", "视频生成", VIDEO_TASK_TIMEOUT))?,
         };
         let status = response.status();
         if !status.is_success() {
@@ -1729,11 +2048,12 @@ async fn generate_video(
     let request = client
         .post(endpoint.clone())
         .bearer_auth(&input.api_key)
+        .timeout(VIDEO_SUBMIT_TIMEOUT)
         .json(&body)
         .send();
     let response = tokio::select! {
         _ = cancellation.cancelled() => return Err(AppError::new("CANCELLED", "本次运行已结束。", false)),
-        response = request => response.map_err(|error| connection_error(&error, "视频生成接口"))?,
+        response = request => response.map_err(|error| request_error(&error, "视频生成接口", "视频任务提交", VIDEO_SUBMIT_TIMEOUT))?,
     };
     let status = response.status();
     if !status.is_success() {
@@ -1756,7 +2076,11 @@ async fn generate_video(
         endpoint.path().trim_end_matches('/'),
         video_id
     ));
+    let task_started = Instant::now();
     loop {
+        if task_started.elapsed() >= VIDEO_TASK_TIMEOUT {
+            return Err(timeout_error("视频生成", VIDEO_TASK_TIMEOUT));
+        }
         match task
             .get("status")
             .and_then(serde_json::Value::as_str)
@@ -1780,10 +2104,11 @@ async fn generate_video(
         let request = client
             .get(status_url.clone())
             .bearer_auth(&input.api_key)
+            .timeout(VIDEO_POLL_TIMEOUT)
             .send();
         let response = tokio::select! {
             _ = cancellation.cancelled() => return Err(AppError::new("CANCELLED", "本次运行已结束。", false)),
-            response = request => response.map_err(|error| connection_error(&error, "视频任务接口"))?,
+            response = request => response.map_err(|error| request_error(&error, "视频任务接口", "视频生成", VIDEO_TASK_TIMEOUT))?,
         };
         let status = response.status();
         if !status.is_success() {
@@ -1818,21 +2143,39 @@ async fn generate_video(
     Ok(GeneratedMedia { data_url: path })
 }
 
+fn openai_usage(usage: OpenAiUsage) -> Usage {
+    Usage {
+        input_tokens: usage.prompt_tokens,
+        output_tokens: usage.completion_tokens,
+        total_tokens: usage.total_tokens,
+        reasoning_tokens: usage
+            .completion_tokens_details
+            .and_then(|details| details.reasoning_tokens),
+    }
+}
+
 fn parse_openai_response(body: OpenAiResponse) -> AppResult<GeneratedText> {
-    let text = body
-        .choices
-        .first()
+    let choice = body.choices.first();
+    let text = choice
         .and_then(|choice| choice.message.content.as_deref())
         .map(str::trim)
         .filter(|text| !text.is_empty())
         .ok_or_else(|| AppError::new("RESPONSE_INVALID", "模型没有返回可展示的文本。", false))?
         .to_string();
-    let usage = body.usage.map(|usage| Usage {
-        input_tokens: usage.prompt_tokens,
-        output_tokens: usage.completion_tokens,
-        total_tokens: usage.total_tokens,
-    });
-    Ok(GeneratedText { text, usage })
+    // 某些推理模型把思考过程放在 reasoning_content 里，
+    // 即使是非流式请求也保留下来，避免这段内容白花钱还看不到。
+    let reasoning = choice
+        .and_then(|choice| choice.message.reasoning_content.as_deref())
+        .map(str::trim)
+        .filter(|text| !text.is_empty())
+        .map(str::to_string);
+    let usage = body.usage.map(openai_usage);
+    Ok(GeneratedText {
+        text,
+        reasoning,
+        usage,
+        first_token_ms: None,
+    })
 }
 
 fn parse_catalog(body: CatalogResponse, output_type: &str) -> AppResult<Vec<CatalogOption>> {
@@ -2074,6 +2417,29 @@ fn disable_unavailable_models(config: &mut AppConfig, models: &[AutoDisabledMode
     changed
 }
 
+/// 生成的图片/音频/视频只是临时产物，不做保存：
+/// 传 `keep` 时保留该目录（当前这一轮），否则把整个目录清空。
+fn clear_media_cache(dir: &Path, keep: Option<&Path>) {
+    let Ok(entries) = fs::read_dir(dir) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if keep.is_some_and(|keep| path == keep) {
+            continue;
+        }
+        let _ = fs::remove_dir_all(&path).or_else(|_| fs::remove_file(&path));
+    }
+}
+
+/// 没有指定模型列表时跑全部；指定时只跑其中被选中的（卡片上的“重新生成”）。
+fn model_selected_for_run(model: &ModelConfig, ids: Option<&[String]>) -> bool {
+    match ids {
+        Some(ids) => ids.iter().any(|id| id == &model.id),
+        None => true,
+    }
+}
+
 fn provider_name(provider_kind: &str) -> &'static str {
     match provider_kind {
         "aihubmix" => "AIHubMix",
@@ -2273,6 +2639,7 @@ async fn connection_test(
             None,
             None,
             CancellationToken::new(),
+            None,
         )
         .await?
         .usage
@@ -2679,6 +3046,7 @@ fn text_run_start(
         image_ratio,
         audio_voice,
         video_seconds,
+        model_config_ids,
     } = input;
     let prompt = prompt.trim().to_string();
     let config = load_config(&state.config_path)?;
@@ -2710,6 +3078,13 @@ fn text_run_start(
         if enabled.is_empty() {
             continue;
         }
+        let enabled: Vec<_> = enabled
+            .into_iter()
+            .filter(|model| model_selected_for_run(model, model_config_ids.as_deref()))
+            .collect();
+        if enabled.is_empty() {
+            continue;
+        }
         let key = get_key(state.inner(), &connection.id)?;
         let (_, base_url) = normalize_base(&connection.base_url)?;
         for model in enabled {
@@ -2732,12 +3107,14 @@ fn text_run_start(
     }
 
     let run_id = Uuid::new_v4().to_string();
-    let media_dir = app
+    let generated_dir = app
         .path()
         .app_cache_dir()
         .map_err(|_| AppError::new("FILE_WRITE_FAILED", "无法读取应用缓存目录。", true))?
-        .join("generated")
-        .join(&run_id);
+        .join("generated");
+    // 生成的图片/音频/视频只是临时产物：开跑前清掉上一轮的目录，避免越积越多。
+    clear_media_cache(&generated_dir, None);
+    let media_dir = generated_dir.join(&run_id);
     fs::create_dir_all(&media_dir)
         .map_err(|_| AppError::new("FILE_WRITE_FAILED", "无法创建媒体缓存目录。", true))?;
     let cancellation = CancellationToken::new();
@@ -2778,6 +3155,15 @@ fn text_run_start(
                 let failed_model_id = target.model_id.clone();
                 let failed_provider_name = provider_name(&target.provider_kind).to_string();
                 let video_path = media_dir.join(format!("{model_config_id}.mp4"));
+                // 文本模型走流式输出，界面可以边收边显示（打字机效果）。
+                let delta_sink = (target.output_type == "text").then(|| DeltaSink {
+                    app: app.clone(),
+                    run_id: run_id.clone(),
+                    model_config_id: model_config_id.clone(),
+                    started,
+                });
+                let mut first_token_ms = None;
+                let mut reasoning_text = None;
                 let result: AppResult<GeneratedOutput> = match target.output_type.as_str() {
                     "image" => generate_image(
                         ImageGenerationRequest {
@@ -2863,14 +3249,19 @@ fn text_run_start(
                         reference_image,
                         system_prompt,
                         cancellation,
+                        delta_sink,
                     )
                     .await
-                    .map(|output| GeneratedOutput {
-                        text: Some(output.text),
-                        image: None,
-                        audio: None,
-                        video: None,
-                        usage: output.usage,
+                    .map(|output| {
+                        first_token_ms = output.first_token_ms;
+                        reasoning_text = output.reasoning;
+                        GeneratedOutput {
+                            text: Some(output.text),
+                            image: None,
+                            audio: None,
+                            video: None,
+                            usage: output.usage,
+                        }
                     }),
                 };
                 let auto_disabled = result.as_ref().err().and_then(|error| {
@@ -2887,10 +3278,12 @@ fn text_run_start(
                         model_config_id,
                         status: "completed",
                         output_text: output.text,
+                        output_reasoning: reasoning_text,
                         output_image: output.image,
                         output_audio: output.audio,
                         output_video: output.video,
                         elapsed_ms: started.elapsed().as_millis() as u64,
+                        first_token_ms,
                         usage: output.usage,
                         error: None,
                     },
@@ -2903,10 +3296,12 @@ fn text_run_start(
                             "failed"
                         },
                         output_text: None,
+                        output_reasoning: None,
                         output_image: None,
                         output_audio: None,
                         output_video: None,
                         elapsed_ms: started.elapsed().as_millis() as u64,
+                        first_token_ms,
                         usage: None,
                         error: Some(error),
                     },
@@ -2987,6 +3382,10 @@ fn text_run_cancel(
 pub fn run() {
     tauri::Builder::default()
         .setup(|app| {
+            // 应用退出后不保留上一轮的生成文件，启动时先清一次。
+            if let Ok(cache_dir) = app.path().app_cache_dir() {
+                clear_media_cache(&cache_dir.join("generated"), None);
+            }
             let config_path = app.path().app_config_dir()?.join("config.json");
             let credentials_path = config_path.with_file_name(CREDENTIALS_FILE_NAME);
             app.manage(AppState {
@@ -3027,17 +3426,102 @@ mod tests {
             choices: vec![OpenAiChoice {
                 message: OpenAiMessage {
                     content: Some("  连接成功  ".into()),
+                    reasoning_content: None,
                 },
             }],
             usage: Some(OpenAiUsage {
                 prompt_tokens: Some(4),
                 completion_tokens: Some(2),
                 total_tokens: Some(6),
+                completion_tokens_details: None,
             }),
         })
         .expect("response should parse");
         assert_eq!(result.text, "连接成功");
+        assert_eq!(result.reasoning, None);
         assert_eq!(result.usage.and_then(|usage| usage.total_tokens), Some(6));
+    }
+
+    #[test]
+    fn keeps_reasoning_tokens_from_non_streaming_response() {
+        let result = parse_openai_response(OpenAiResponse {
+            choices: vec![OpenAiChoice {
+                message: OpenAiMessage {
+                    content: Some("答案".into()),
+                    reasoning_content: Some("  先想想  ".into()),
+                },
+            }],
+            usage: Some(OpenAiUsage {
+                prompt_tokens: Some(8),
+                completion_tokens: Some(657),
+                total_tokens: Some(665),
+                completion_tokens_details: Some(OpenAiUsageDetails {
+                    reasoning_tokens: Some(496),
+                }),
+            }),
+        })
+        .expect("response should parse");
+        assert_eq!(result.reasoning.as_deref(), Some("先想想"));
+        let usage = result.usage.expect("usage");
+        assert_eq!(usage.reasoning_tokens, Some(496));
+        assert_eq!(usage.output_tokens, Some(657));
+    }
+
+    #[test]
+    fn accumulates_stream_deltas_and_usage() {
+        let started = Instant::now();
+        let mut state = ChatStreamState::default();
+        let lines = [
+            "data: {\"choices\":[{\"delta\":{\"reasoning_content\":\"先看题\"}}]}",
+            "",
+            "data: {\"choices\":[{\"delta\":{\"content\":\"李白\"}}]}",
+            "data: {\"choices\":[{\"delta\":{\"content\":\"是诗人\"}}]}",
+            "data: {\"choices\":[{\"delta\":{}}],\"usage\":{\"prompt_tokens\":6,\"completion_tokens\":900,\"total_tokens\":906,\"completion_tokens_details\":{\"reasoning_tokens\":700}}}",
+            "data: [DONE]",
+            "data: not-json",
+        ];
+        for line in lines {
+            apply_stream_line(&mut state, line, started);
+        }
+        assert_eq!(state.content, "李白是诗人");
+        assert_eq!(state.reasoning, "先看题");
+        assert_eq!(state.first_token_ms.is_some(), true);
+        let usage = state.usage.expect("usage");
+        assert_eq!(usage.reasoning_tokens, Some(700));
+        assert_eq!(usage.total_tokens, Some(906));
+    }
+
+    #[test]
+    fn stream_body_asks_for_usage() {
+        let mut body = chat_request_body(
+            "Qwen/Qwen3-14B",
+            serde_json::Value::String("你好".into()),
+            None,
+            None,
+        );
+        assert_eq!(body["stream"], serde_json::Value::Bool(false));
+        stream_request_body(&mut body);
+        assert_eq!(body["stream"], serde_json::Value::Bool(true));
+        assert_eq!(body["stream_options"]["include_usage"], serde_json::Value::Bool(true));
+    }
+
+    #[test]
+    fn clears_media_cache_but_keeps_current_run() {
+        let root = std::env::temp_dir().join(format!("model-battle-media-{}", Uuid::new_v4()));
+        let keep = root.join("current");
+        let stale = root.join("stale");
+        fs::create_dir_all(&keep).expect("create keep");
+        fs::create_dir_all(&stale).expect("create stale");
+        fs::write(keep.join("video.mp4"), b"current").expect("write keep");
+        fs::write(stale.join("video.mp4"), b"stale").expect("write stale");
+
+        clear_media_cache(&root, Some(&keep));
+        assert!(keep.join("video.mp4").exists());
+        assert!(!stale.exists());
+
+        clear_media_cache(&root, None);
+        assert!(!keep.exists());
+        fs::remove_dir_all(&root).expect("cleanup");
     }
 
     #[test]
@@ -3137,7 +3621,7 @@ mod tests {
         );
         assert_eq!(
             siliconflow_audio.as_str(),
-            "https://api.siliconflow.cn/v1/models?type=audio"
+            "https://api.siliconflow.cn/v1/models?sub_type=text-to-speech"
         );
         let siliconflow_stt = models_endpoint(
             "siliconflow",
@@ -3172,25 +3656,36 @@ mod tests {
 
     #[test]
     fn builds_provider_specific_audio_requests() {
+        // 界面给的是平台真实音色名，后端只负责拼成硅基流动要的“模型:音色”格式。
         let silicon = speech_request_body(
             "siliconflow",
             "FunAudioLLM/CosyVoice2-0.5B",
             "你好",
-            "echo",
+            "alex",
             "mp3",
         );
         assert_eq!(silicon["voice"], "FunAudioLLM/CosyVoice2-0.5B:alex");
         assert_eq!(silicon["input"], "你好");
 
+        let silicon_female = speech_request_body(
+            "siliconflow",
+            "FunAudioLLM/CosyVoice2-0.5B",
+            "你好",
+            "diana",
+            "mp3",
+        );
+        assert_eq!(silicon_female["voice"], "FunAudioLLM/CosyVoice2-0.5B:diana");
+
         let moss =
-            speech_request_body("siliconflow", "fnlp/MOSS-TTSD-v0.5", "你好", "alloy", "mp3");
-        assert_eq!(moss["voice"], "fnlp/MOSS-TTSD-v0.5:anna");
+            speech_request_body("siliconflow", "fnlp/MOSS-TTSD-v0.5", "你好", "alex", "mp3");
+        assert_eq!(moss["voice"], "fnlp/MOSS-TTSD-v0.5:alex");
         assert_eq!(moss["input"], "[S1]你好");
 
         let openai = speech_request_body("aihubmix", "tts-1", "hello", "alloy", "mp3");
         assert_eq!(openai["voice"], "alloy");
         assert_eq!(openai["input"], "hello");
 
+        // 旧的占位音色名仍然能映射到平台音色，保持向后兼容。
         let qwen_plus = speech_request_body(
             "aihubmix",
             "qwen-audio-3.0-tts-plus",
@@ -3207,6 +3702,169 @@ mod tests {
             "mp3",
         );
         assert_eq!(qwen_flash["voice"], "longanxiaoxin");
+
+        // 新版本直接传平台真实音色名。
+        let qwen_real = speech_request_body(
+            "aihubmix",
+            "qwen-audio-3.0-tts-plus",
+            "你好",
+            "longanlufeng",
+            "mp3",
+        );
+        assert_eq!(qwen_real["voice"], "longanlufeng");
+    }
+
+    #[tokio::test]
+    async fn reports_stalled_streams_as_timeouts() {
+        use std::io::{Read, Write};
+        use std::net::TcpListener;
+
+        // 假服务端：回一段 SSE 后就闭嘴，但连接保持不断开。
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
+        let addr = listener.local_addr().expect("addr");
+        std::thread::spawn(move || {
+            if let Ok((mut stream, _)) = listener.accept() {
+                let mut buffer = [0u8; 2048];
+                let _ = stream.read(&mut buffer);
+                let _ = stream.write_all(
+                    b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nTransfer-Encoding: chunked\r\n\r\n",
+                );
+                let payload = b"data: {\"choices\":[{\"delta\":{\"content\":\"hi\"}}]}\n\n";
+                let _ = stream.write_all(format!("{:x}\r\n", payload.len()).as_bytes());
+                let _ = stream.write_all(payload);
+                let _ = stream.write_all(b"\r\n");
+                let _ = stream.flush();
+                std::thread::sleep(Duration::from_secs(10));
+            }
+        });
+
+        let mut response = http_client()
+            .expect("client")
+            .post(format!("http://{addr}/v1/chat/completions"))
+            .json(&serde_json::json!({"model": "test"}))
+            .send()
+            .await
+            .expect("response");
+        let cancellation = CancellationToken::new();
+        let first = next_stream_chunk(&mut response, Duration::from_secs(1), &cancellation)
+            .await
+            .expect("first chunk");
+        assert!(first.is_some());
+
+        // 之后一直没有新数据：必须报超时，并写明等了多少时长
+        let error = next_stream_chunk(&mut response, Duration::from_secs(1), &cancellation)
+            .await
+            .expect_err("should time out");
+        assert_eq!(error.code, "MODEL_TIMEOUT");
+        assert!(error.retryable);
+        assert!(error.message.contains("已超时"));
+        assert!(error.message.contains("1 秒"));
+
+        // 手动结束运行时不报超时，报“已结束”
+        let cancelled = CancellationToken::new();
+        cancelled.cancel();
+        let error = next_stream_chunk(&mut response, Duration::from_secs(5), &cancelled)
+            .await
+            .expect_err("should cancel");
+        assert_eq!(error.code, "CANCELLED");
+    }
+
+    #[test]
+    fn describes_timeouts_with_a_clear_limit() {
+        assert_eq!(human_duration(Duration::from_secs(60)), "60 秒");
+        assert_eq!(human_duration(Duration::from_secs(120)), "2 分钟");
+        assert_eq!(human_duration(Duration::from_secs(180)), "3 分钟");
+        assert_eq!(human_duration(Duration::from_secs(300)), "5 分钟");
+        assert_eq!(human_duration(Duration::from_secs(600)), "10 分钟");
+        assert_eq!(human_duration(Duration::from_secs(90)), "90 秒");
+        assert_eq!(human_duration(Duration::from_secs(150)), "2 分 30 秒");
+
+        // 文本：整体超时和流式卡死两种提示都要写清时长
+        let total = timeout_error("文本生成", TEXT_TIMEOUT);
+        assert_eq!(total.code, "MODEL_TIMEOUT");
+        assert!(total.retryable);
+        assert!(total.message.contains("文本生成"));
+        assert!(total.message.contains("5 分钟"));
+
+        let stalled = stream_stall_error(TEXT_STREAM_STALL_TIMEOUT);
+        assert!(stalled.message.contains("60 秒"));
+        assert!(stalled.message.contains("没有收到新的内容"));
+
+        // 图片 / 音频 / 视频各自的兜底时长
+        assert!(timeout_error("连接测试", CONNECTION_TEST_TIMEOUT).message.contains("30 秒"));
+        assert!(timeout_error("图片生成", IMAGE_TIMEOUT).message.contains("3 分钟"));
+        assert!(timeout_error("音频合成", SPEECH_TIMEOUT).message.contains("2 分钟"));
+        assert!(timeout_error("音频转写", TRANSCRIBE_TIMEOUT).message.contains("3 分钟"));
+        assert!(timeout_error("视频生成", VIDEO_TASK_TIMEOUT).message.contains("10 分钟"));
+    }
+
+    #[test]
+    fn runs_only_the_requested_models() {
+        let model = |id: &str| ModelConfig {
+            id: id.into(),
+            model_id: format!("model-{id}"),
+            display_name: format!("model-{id}"),
+            output_type: "text".into(),
+            supports_reference_image: false,
+            enabled: true,
+        };
+        let first = model("a");
+        let second = model("b");
+        assert!(model_selected_for_run(&first, None));
+        assert!(model_selected_for_run(&second, None));
+        assert!(model_selected_for_run(&first, Some(&["a".to_string()])));
+        assert!(!model_selected_for_run(&second, Some(&["a".to_string()])));
+        // 指定了不属于当前类型的 ID 时什么都不跑
+        assert!(!model_selected_for_run(&first, Some(&["zzz".to_string()])));
+    }
+
+    #[test]
+    fn moves_speech_recognition_models_out_of_the_tts_arena() {
+        let mut config = AppConfig::default();
+        config.connections.push(Connection {
+            id: "connection".into(),
+            display_name: "硅基流动".into(),
+            provider_kind: "siliconflow".into(),
+            base_url: "https://api.siliconflow.cn/v1".into(),
+            has_credential: true,
+            credential_length: None,
+            models: vec![
+                ModelConfig {
+                    id: "asr".into(),
+                    model_id: "FunAudioLLM/SenseVoiceSmall".into(),
+                    display_name: "SenseVoiceSmall".into(),
+                    output_type: "audio".into(),
+                    supports_reference_image: true,
+                    enabled: true,
+                },
+                ModelConfig {
+                    id: "asr-2".into(),
+                    model_id: "Qwen/Qwen3-ASR-1.7B".into(),
+                    display_name: "Qwen3-ASR".into(),
+                    output_type: "audio".into(),
+                    supports_reference_image: false,
+                    enabled: true,
+                },
+                ModelConfig {
+                    id: "tts".into(),
+                    model_id: "FunAudioLLM/CosyVoice2-0.5B".into(),
+                    display_name: "CosyVoice2".into(),
+                    output_type: "audio".into(),
+                    supports_reference_image: false,
+                    enabled: true,
+                },
+            ],
+        });
+
+        assert!(reclassify_speech_recognition_models(&mut config));
+        let models = &config.connections[0].models;
+        assert_eq!(models[0].output_type, "audio_to_text");
+        assert_eq!(models[0].supports_reference_image, false);
+        assert_eq!(models[1].output_type, "audio_to_text");
+        // 真正的语音合成模型留在原地
+        assert_eq!(models[2].output_type, "audio");
+        // 已经修好的配置不再重复变更
+        assert!(!reclassify_speech_recognition_models(&mut config));
     }
 
     #[test]

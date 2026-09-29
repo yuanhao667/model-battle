@@ -1,7 +1,9 @@
-import { ChangeEvent, FormEvent, MouseEvent as ReactMouseEvent, useEffect, useMemo, useRef, useState } from "react";
+import { ChangeEvent, FormEvent, MouseEvent as ReactMouseEvent, memo, useEffect, useMemo, useRef, useState } from "react";
 import { convertFileSrc, invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import { getCurrentWindow } from "@tauri-apps/api/window";
+import DOMPurify from "dompurify";
+import { marked } from "marked";
 import "./App.css";
 
 type AppError = {
@@ -74,6 +76,7 @@ type Usage = {
   inputTokens?: number;
   outputTokens?: number;
   totalTokens?: number;
+  reasoningTokens?: number;
 };
 
 type ModelResult = {
@@ -81,12 +84,25 @@ type ModelResult = {
   modelConfigId: string;
   status: "running" | "completed" | "failed" | "ended";
   outputText?: string;
+  /** 推理模型的思考过程，流式输出时才有。 */
+  outputReasoning?: string;
   outputImage?: string;
   outputAudio?: string;
   outputVideo?: string;
+  /** 从发出请求到第一个字的耗时。 */
+  firstTokenMs?: number;
   elapsedMs: number;
   usage?: Usage;
   error?: AppError;
+};
+
+/** 流式输出时后端按批推过来的增量内容。 */
+type ModelTextDelta = {
+  runId: string;
+  modelConfigId: string;
+  content: string;
+  reasoning: string;
+  elapsedMs: number;
 };
 
 type RunFinished = {
@@ -181,6 +197,20 @@ function CloseIcon() {
 function DownloadIcon() {
   return <svg viewBox="0 0 20 20" aria-hidden="true">
     <path d="M10 3v9m-3-3 3 3 3-3M4 15v2h12v-2" />
+  </svg>;
+}
+
+function RefreshIcon() {
+  return <svg viewBox="0 0 20 20" aria-hidden="true">
+    <path d="M16 6.5V3.5l-1.6 1.6A6.2 6.2 0 0 0 3.8 10" />
+    <path d="M4 13.5v3l1.6-1.6A6.2 6.2 0 0 0 16.2 10" />
+  </svg>;
+}
+
+function CopyIcon() {
+  return <svg viewBox="0 0 20 20" aria-hidden="true">
+    <rect x="7" y="7" width="9" height="10" rx="1.6" />
+    <path d="M13 4.5H5.6A1.6 1.6 0 0 0 4 6.1V13" />
   </svg>;
 }
 
@@ -473,6 +503,201 @@ function connectionTypeLabel(models: ModelConfig[]) {
   return [...new Set(models.map(modelCategoryLabel))].join(" / ");
 }
 
+type VoiceOption = { value: string; label: string };
+
+// 硅基流动系统预置的 8 个音色（官方文档给的名称和特点），
+// 界面上显示的名字就是实际发给接口的音色名，不再用别家的占位名。
+const siliconflowVoices: VoiceOption[] = [
+  { value: "alex", label: "alex（沉稳男声）" },
+  { value: "benjamin", label: "benjamin（低沉男声）" },
+  { value: "charles", label: "charles（磁性男声）" },
+  { value: "david", label: "david（欢快男声）" },
+  { value: "anna", label: "anna（沉稳女声）" },
+  { value: "bella", label: "bella（激情女声）" },
+  { value: "claire", label: "claire（温柔女声）" },
+  { value: "diana", label: "diana（欢快女声）" },
+];
+
+// OpenAI 兼容语音接口的音色名（AIHubMix 的 tts 系列、自定义连接）。
+const openAiVoices: VoiceOption[] = [
+  { value: "alloy", label: "alloy（中性）" },
+  { value: "echo", label: "echo（沉稳）" },
+  { value: "fable", label: "fable（叙事）" },
+  { value: "onyx", label: "onyx（深沉）" },
+  { value: "nova", label: "nova（明亮）" },
+  { value: "shimmer", label: "shimmer（轻柔）" },
+];
+
+// AIHubMix 上通义千问语音合成的音色名（平台原样返回，不做二次包装）。
+const qwenTtsVoices: VoiceOption[] = [
+  { value: "longanfengyue", label: "longanfengyue" },
+  { value: "loongjohn", label: "loongjohn" },
+  { value: "longanyuanfei", label: "longanyuanfei" },
+  { value: "longchuanshu_v3.6", label: "longchuanshu_v3.6" },
+  { value: "longanxiaoxin", label: "longanxiaoxin" },
+  { value: "longanlingxi", label: "longanlingxi" },
+  { value: "longanlufeng", label: "longanlufeng" },
+  { value: "longanlingxin", label: "longanlingxin" },
+];
+
+/** 音色选项要跟着实际用的模型走，取不到真实音色列表时宁可不显示这个控件。 */
+function voiceOptionsFor(models: Array<{ connection: Connection; model: ModelConfig }>): VoiceOption[] {
+  const first = models[0];
+  if (!first) return [];
+  if (first.model.modelId.toLowerCase().includes("qwen-audio-3.0-tts")) return qwenTtsVoices;
+  if (first.connection.providerKind === "siliconflow") return siliconflowVoices;
+  return openAiVoices;
+}
+
+marked.setOptions({ gfm: true, breaks: true });
+
+/** 模型输出基本是 Markdown，渲染成 HTML 后再消毒，避免把模型的脏数据带进界面。 */
+function renderMarkdown(text: string) {
+  const html = marked.parse(text, { async: false }) as string;
+  return DOMPurify.sanitize(html);
+}
+
+const MarkdownText = memo(function MarkdownText({ text }: { text: string }) {
+  const html = useMemo(() => renderMarkdown(text), [text]);
+  return <div className="markdown-body" dangerouslySetInnerHTML={{ __html: html }} />;
+});
+
+function secondsText(elapsedMs?: number) {
+  return elapsedMs === undefined ? "-- 秒" : `${(elapsedMs / 1000).toFixed(1)} 秒`;
+}
+
+/** 从待显示缓冲区里取出一小段字符，让文字看起来像在逐字打出来。 */
+function revealChunk(entry: { content: string; reasoning: string }, key: "content" | "reasoning") {
+  const value = entry[key];
+  if (!value) return "";
+  const size = Math.max(4, Math.ceil(value.length / 6));
+  entry[key] = value.slice(size);
+  return value.slice(0, size);
+}
+
+/** 出字速度：推理模型的思考 token 也算在内，所以从“首字之后”开始算更公平。 */
+function tokensPerSecond(result?: ModelResult) {
+  const outputTokens = result?.usage?.outputTokens;
+  if (!result || result.status !== "completed" || !outputTokens || !result.elapsedMs) return undefined;
+  const firstToken = result.firstTokenMs;
+  const generationMs = firstToken !== undefined && result.elapsedMs > firstToken
+    ? result.elapsedMs - firstToken
+    : result.elapsedMs;
+  return generationMs > 0 ? outputTokens / (generationMs / 1000) : undefined;
+}
+
+function speedText(result?: ModelResult) {
+  const speed = tokensPerSecond(result);
+  return speed === undefined ? undefined : `${speed.toFixed(1)} tok/s`;
+}
+
+function ReasoningBlock({ text, hasAnswer }: { text: string; hasAnswer: boolean }) {
+  const [open, setOpen] = useState(false);
+  // 答案还没开始前把思考过程直接翻开展示，让用户知道模型没卡住。
+  if (!hasAnswer) return <div className="reasoning-live">
+    <span className="reasoning-label">思考中…</span>
+    <p className="reasoning-text">{text}</p>
+  </div>;
+  return <div className={`reasoning-block ${open ? "is-open" : ""}`}>
+    <button type="button" className="reasoning-toggle" aria-expanded={open} onClick={() => setOpen((current) => !current)}>
+      {open ? "收起思考过程" : "查看思考过程"}
+    </button>
+    {open && <p className="reasoning-text">{text}</p>}
+  </div>;
+}
+
+function ResultCard({
+  model,
+  connectionName,
+  result,
+  running,
+  showTokenMetrics,
+  canRegenerate,
+  onRegenerate,
+  onCopy,
+  onDownloadAudio,
+}: {
+  model: ModelConfig;
+  connectionName: string;
+  result?: ModelResult;
+  running: boolean;
+  showTokenMetrics: boolean;
+  canRegenerate: boolean;
+  onRegenerate: (model: ModelConfig) => void;
+  onCopy: (result: ModelResult, model: ModelConfig) => void;
+  onDownloadAudio: (dataUrl: string, modelName: string) => void;
+}) {
+  const status = result?.status ?? (running ? "running" : "idle");
+  const statusText = {
+    idle: "待运行", running: "生成中", completed: "已完成", failed: "失败", ended: "已结束",
+  }[status];
+  const speed = speedText(result);
+  const reasoning = result?.outputReasoning;
+  // 和复制/下载一样：这一张卡还没有结果时，不显示"重新生成"；
+  // 已经有别的模型在跑的时候也不显示，免得给出一个点不动的图标。
+  const showRegenerate = Boolean(result) && !running;
+  const hasActions = showRegenerate || Boolean(result?.outputText) || Boolean(result?.outputAudio);
+
+  return (
+    <article className="model-card result-card" key={model.id}>
+      <header data-model-name={model.displayName}>
+        <h2
+          onMouseEnter={(event) => {
+            event.currentTarget.toggleAttribute(
+              "data-truncated",
+              event.currentTarget.scrollWidth > event.currentTarget.clientWidth,
+            );
+          }}
+        >
+          {model.displayName}
+        </h2>
+        <span className={`status status-${status}`}>
+          <i className="status-dot" aria-hidden="true" />
+          {statusText}
+        </span>
+      </header>
+      <div className="result-content">
+        {reasoning && <ReasoningBlock text={reasoning} hasAnswer={Boolean(result?.outputText)} />}
+        {result?.outputText && <MarkdownText text={result.outputText} />}
+        {result?.outputImage && <img src={result.outputImage} alt={`${model.displayName} 生成结果`} />}
+        {result?.outputAudio && <audio src={mediaSrc(result.outputAudio)} controls preload="metadata" />}
+        {result?.outputVideo && <video src={mediaSrc(result.outputVideo)} controls preload="metadata" />}
+        {result?.error && <p className="error-copy" role="alert">{result.error.message}</p>}
+      </div>
+      <footer title={`连接：${connectionName}`}>
+        {/* 流式输出时用增量事件带回来的时间，边生成边跳动。 */}
+        <span>{secondsText(result && (result.status !== "running" || result.elapsedMs > 0) ? result.elapsedMs : undefined)}</span>
+        {speed && <span>{speed}</span>}
+        {showTokenMetrics && <span>输出 {metric(result?.usage?.outputTokens)}</span>}
+        {hasActions && <span className="card-actions">
+          {showRegenerate && <button
+            type="button"
+            className="card-action"
+            data-tip="重新生成"
+            aria-label={`重新生成 ${model.displayName}`}
+            disabled={!canRegenerate}
+            onClick={() => onRegenerate(model)}
+          ><RefreshIcon /></button>}
+          {result?.outputText && <button
+            type="button"
+            className="card-action"
+            data-tip="复制回答"
+            aria-label={`复制 ${model.displayName} 的回答`}
+            onClick={() => onCopy(result, model)}
+          ><CopyIcon /></button>}
+          {result?.outputAudio && <button
+            type="button"
+            className="card-action"
+            data-tip="下载音频"
+            aria-label={`下载 ${model.displayName} 音频`}
+            onClick={() => onDownloadAudio(result.outputAudio!, model.displayName)}
+          ><DownloadIcon /></button>}
+        </span>}
+      </footer>
+    </article>
+  );
+}
+
 export default function App() {
   const [config, setConfig] = useState<AppConfig>(emptyConfig);
   const [loading, setLoading] = useState(true);
@@ -483,9 +708,12 @@ export default function App() {
   const [busy, setBusy] = useState(false);
   const [notice, setNotice] = useState("");
   const [noticeSuccess, setNoticeSuccess] = useState(false);
-  const [prompt, setPrompt] = useState("");
+  // 提示词按 Arena 类型分开保存：图片、文本、音频之间互不影响，切换时各自保留自己的内容。
+  const [prompts, setPrompts] = useState<Partial<Record<OutputType, string>>>({});
   const [referenceImage, setReferenceImage] = useState<{ name: string; dataUrl: string }>();
   const [audioInput, setAudioInput] = useState<{ name: string; dataUrl: string }>();
+  // 「模型配置」里测试连接用的音频单独存，避免和主页音频转文本的输入互相污染。
+  const [testAudioInput, setTestAudioInput] = useState<{ name: string; dataUrl: string }>();
   const [imageRatio, setImageRatio] = useState("1:1");
   const [videoRatio, setVideoRatio] = useState("16:9");
   const [audioVoice, setAudioVoice] = useState("alloy");
@@ -508,6 +736,21 @@ export default function App() {
     void getCurrentWindow().startDragging();
   }
 
+  const prompt = prompts[config.activeArenaType] ?? "";
+
+  function updatePrompt(value: string) {
+    setPrompts((current) => ({ ...current, [config.activeArenaType]: value }));
+  }
+
+  // 清空当前 Arena：用户输入（提示词、参考图、音频）与模型生成的内容一起清掉，不影响其他 Arena 类型。
+  function clearArena() {
+    setNotice("");
+    setPrompts((current) => ({ ...current, [config.activeArenaType]: "" }));
+    setReferenceImage(undefined);
+    setAudioInput(undefined);
+    setResults({});
+  }
+
   const enabledModels = useMemo(() => config.connections.flatMap((connection) =>
     connection.models
       .filter((model) => model.enabled && model.outputType === config.activeArenaType)
@@ -515,6 +758,24 @@ export default function App() {
   ), [config]);
 
   const configuredConnections = useMemo(() => config.connections.filter((connection) => connection.models.length > 0), [config]);
+
+  // 主按钮和卡片上的"重新生成"共用同一套前置条件。
+  const canRun = !running
+    && enabledModels.length > 0
+    && Boolean(config.activeArenaType === "audio_to_text" ? audioInput : prompt.trim());
+
+  // 音色按实际用到的模型平台给，选中的值就是发出去的值。
+  const voiceOptions = useMemo(() => voiceOptionsFor(enabledModels), [enabledModels]);
+  const audioVoiceValue = voiceOptions.some((option) => option.value === audioVoice)
+    ? audioVoice
+    : voiceOptions[0]?.value ?? "";
+
+  // 视频时长不是每个平台都能指定：硅基流动的视频接口只有 model/prompt/image_size/image，
+  // 没有时长字段，所以那边不提供选择器，避免给出一个不起作用的控件。
+  const videoSecondsSelectable = useMemo(
+    () => enabledModels.every(({ connection }) => connection.providerKind !== "siliconflow"),
+    [enabledModels],
+  );
 
   // 集成平台连上之后，添加卡片原地变成"已连接"卡片（不能再加一条）；
   // 自定义模型可以有多条，所以永远保留"添加"卡片。
@@ -581,12 +842,40 @@ export default function App() {
       : [...current, providerKind]);
   }
 
+  // 流式输出的待显示缓冲区（打字机效果），key 是模型配置 ID。
+  const pendingDeltasRef = useRef<Record<string, { content: string; reasoning: string; elapsedMs: number }>>({});
+
   useEffect(() => {
     void refreshSettings();
     let disposed = false;
     const stops: Array<() => void> = [];
     void listen<ModelResult>("text-model-finished", ({ payload }) => {
-      if (!disposed) setResults((current) => ({ ...current, [payload.modelConfigId]: payload }));
+      if (disposed) return;
+      const finished = payload.outputText ? { content: "", reasoning: "", elapsedMs: payload.elapsedMs } : undefined;
+      if (finished) {
+        // 完整结果已经拿到，丢掉还没显示完的增量，避免重复拼接。
+        pendingDeltasRef.current[payload.modelConfigId] = finished;
+      }
+      setResults((current) => {
+        const previous = current[payload.modelConfigId];
+        return {
+          ...current,
+          [payload.modelConfigId]: {
+            ...payload,
+            // 手动结束或失败时，保留流式过程中已经显示出来的部分内容。
+            outputText: payload.outputText ?? previous?.outputText,
+            outputReasoning: payload.outputReasoning ?? previous?.outputReasoning,
+          },
+        };
+      });
+    }).then((stop) => disposed ? stop() : stops.push(stop));
+    void listen<ModelTextDelta>("text-model-delta", ({ payload }) => {
+      if (disposed) return;
+      const entry = pendingDeltasRef.current[payload.modelConfigId] ?? { content: "", reasoning: "", elapsedMs: 0 };
+      entry.content += payload.content;
+      entry.reasoning += payload.reasoning;
+      entry.elapsedMs = Math.max(entry.elapsedMs, payload.elapsedMs);
+      pendingDeltasRef.current[payload.modelConfigId] = entry;
     }).then((stop) => disposed ? stop() : stops.push(stop));
     void listen<RunFinished>("text-run-finished", ({ payload }) => {
       if (disposed) return;
@@ -610,6 +899,54 @@ export default function App() {
       disposed = true;
       stops.forEach((stop) => stop());
     };
+  }, []);
+
+  // 同一时刻只允许播一条音频/视频：开始播新的，旧的自动暂停。
+  useEffect(() => {
+    const pauseOthers = (event: Event) => {
+      const target = event.target;
+      if (!(target instanceof HTMLMediaElement)) return;
+      document.querySelectorAll<HTMLMediaElement>("audio, video").forEach((element) => {
+        if (element !== target && !element.paused) element.pause();
+      });
+    };
+    // media 的 play 事件不冒泡，用捕获阶段在 document 上统一处理。
+    document.addEventListener("play", pauseOthers, true);
+    return () => document.removeEventListener("play", pauseOthers, true);
+  }, []);
+
+  // 打字机效果：每 60ms 把缓冲区里的字拿出来逐渐显示，而不是一次性刷上去。
+  useEffect(() => {
+    const timer = window.setInterval(() => {
+      const pending = pendingDeltasRef.current;
+      const ids = Object.keys(pending);
+      if (!ids.length) return;
+      setResults((current) => {
+        let changed = false;
+        const draft = { ...current };
+        for (const modelConfigId of ids) {
+          const entry = pending[modelConfigId];
+          const existing = draft[modelConfigId];
+          if (!entry.content && !entry.reasoning) continue;
+          if (!existing) {
+            pending[modelConfigId] = { content: "", reasoning: "", elapsedMs: entry.elapsedMs };
+            continue;
+          }
+          const content = revealChunk(entry, "content");
+          const reasoning = revealChunk(entry, "reasoning");
+          if (!content && !reasoning && entry.elapsedMs === existing.elapsedMs) continue;
+          draft[modelConfigId] = {
+            ...existing,
+            outputText: `${existing.outputText ?? ""}${content}`,
+            outputReasoning: `${existing.outputReasoning ?? ""}${reasoning}`,
+            elapsedMs: Math.max(existing.elapsedMs, entry.elapsedMs),
+          };
+          changed = true;
+        }
+        return changed ? draft : current;
+      });
+    }, 60);
+    return () => window.clearInterval(timer);
   }, []);
 
   useEffect(() => {
@@ -773,7 +1110,7 @@ export default function App() {
           apiKey: editor.replaceCredential ? editor.apiKey.trim() || undefined : undefined,
           modelId: editor.modelId,
           outputType: editor.providerKind === "openai_compatible" ? editor.outputType : editor.catalogFilter,
-          audioInput: editor.outputType === "audio_to_text" ? audioInput?.dataUrl : undefined,
+          audioInput: editor.outputType === "audio_to_text" ? testAudioInput?.dataUrl : undefined,
         },
       });
       setEditor((current) => current ? { ...current, validationToken: response.validationToken } : current);
@@ -950,7 +1287,11 @@ export default function App() {
     reader.readAsDataURL(file);
   }
 
-  function chooseAudioInput(event: ChangeEvent<HTMLInputElement>) {
+  /** 主页与「模型配置」各自传入自己的 setter，两份音频互不影响。 */
+  function chooseAudioInput(
+    event: ChangeEvent<HTMLInputElement>,
+    apply: (value: { name: string; dataUrl: string }) => void,
+  ) {
     const file = event.target.files?.[0];
     event.target.value = "";
     if (!file) return;
@@ -973,7 +1314,7 @@ export default function App() {
     reader.onload = () => {
       if (typeof reader.result === "string") {
         const dataUrl = reader.result.replace(/^data:[^;,]*/, `data:${audioMimeType(file.name)}`);
-        setAudioInput({ name: file.name, dataUrl });
+        apply({ name: file.name, dataUrl });
         setNotice("");
       }
     };
@@ -984,16 +1325,24 @@ export default function App() {
     reader.readAsDataURL(file);
   }
 
-  async function run() {
-    if (running || !enabledModels.length) return;
+  /** 传 modelIds 时只重跑这几个模型（卡片上的"重新生成"），不传则跑当前类型全部启用模型。 */
+  async function run(modelIds?: string[]) {
+    const targets = modelIds
+      ? enabledModels.filter(({ model }) => modelIds.includes(model.id))
+      : enabledModels;
+    if (running || !targets.length) return;
     setNotice("");
     setRunning(true);
-    setResults(Object.fromEntries(enabledModels.map(({ model }) => [model.id, {
-      runId: "",
-      modelConfigId: model.id,
-      status: "running",
-      elapsedMs: 0,
-    }])));
+    setResults((current) => {
+      const next: Record<string, ModelResult> = modelIds ? { ...current } : {};
+      for (const { model } of targets) {
+        next[model.id] = { runId: "", modelConfigId: model.id, status: "running", elapsedMs: 0 };
+      }
+      return next;
+    });
+    for (const { model } of targets) {
+      pendingDeltasRef.current[model.id] = { content: "", reasoning: "", elapsedMs: 0 };
+    }
     try {
       const started = await invoke<{ runId: string }>("text_run_start", {
         input: {
@@ -1001,8 +1350,9 @@ export default function App() {
           referenceImage: referenceImage?.dataUrl,
           audioInput: audioInput?.dataUrl,
           imageRatio: config.activeArenaType === "video" ? videoRatio : imageRatio,
-          audioVoice,
+          audioVoice: audioVoiceValue,
           videoSeconds,
+          modelConfigIds: modelIds,
         },
       });
       setRunId(started.runId);
@@ -1010,8 +1360,14 @@ export default function App() {
       setRunning(false);
       setNotice(messageFrom(error));
       setNoticeSuccess(false);
-      setResults({});
+      setResults((current) => modelIds
+        ? Object.fromEntries(Object.entries(current).filter(([id]) => !modelIds.includes(id)))
+        : {});
     }
+  }
+
+  function regenerateModel(model: ModelConfig) {
+    void run([model.id]);
   }
 
   async function cancel() {
@@ -1033,6 +1389,30 @@ export default function App() {
       setNotice(messageFrom(error));
       setNoticeSuccess(false);
     }
+  }
+
+  // WKWebView 里 navigator.clipboard 有时不可用，退回选中临时文本框的方案。
+  async function copyResult(result: ModelResult, model: ModelConfig) {
+    const text = result.outputText ?? "";
+    if (!text.trim()) return;
+    try {
+      await navigator.clipboard.writeText(text);
+    } catch {
+      const area = document.createElement("textarea");
+      area.value = text;
+      area.setAttribute("readonly", "");
+      area.style.position = "fixed";
+      area.style.opacity = "0";
+      document.body.appendChild(area);
+      area.select();
+      try {
+        document.execCommand("copy");
+      } finally {
+        document.body.removeChild(area);
+      }
+    }
+    setNotice(`已复制 ${model.displayName} 的回答。`);
+    setNoticeSuccess(true);
   }
 
   return (
@@ -1094,9 +1474,10 @@ export default function App() {
           </div>
         ) : (
           <textarea
+            key={config.activeArenaType}
             value={prompt}
             onChange={(event) => {
-              setPrompt(event.target.value);
+              updatePrompt(event.target.value);
               event.currentTarget.style.height = "auto";
               event.currentTarget.style.height = `${event.currentTarget.scrollHeight}px`;
             }}
@@ -1131,27 +1512,20 @@ export default function App() {
               disabled={running}
             />
           )}
-          {config.activeArenaType === "audio" && (
+          {config.activeArenaType === "audio" && !!voiceOptions.length && (
             <SelectMenu
               label="生成音色"
-              value={audioVoice}
-              options={[
-                { value: "alloy", label: "alloy（中性）" },
-                { value: "echo", label: "echo（沉稳）" },
-                { value: "fable", label: "fable（叙事）" },
-                { value: "onyx", label: "onyx（深沉）" },
-                { value: "nova", label: "nova（明亮）" },
-                { value: "shimmer", label: "shimmer（轻柔）" },
-              ]}
+              value={audioVoiceValue}
+              options={voiceOptions}
               onChange={setAudioVoice}
               disabled={running}
             />
           )}
           {config.activeArenaType === "audio_to_text" && <label className={`upload-button ${running ? "is-disabled" : ""}`}>
             ＋ {audioInput ? "更换音频" : "添加音频"}
-            <input type="file" accept={audioFileAccept} onChange={chooseAudioInput} disabled={running} />
+            <input type="file" accept={audioFileAccept} onChange={(event) => void chooseAudioInput(event, setAudioInput)} disabled={running} />
           </label>}
-          {config.activeArenaType === "video" && (
+          {config.activeArenaType === "video" && (videoSecondsSelectable ? (
             <SelectMenu
               label="视频时长"
               value={videoSeconds}
@@ -1159,13 +1533,24 @@ export default function App() {
               onChange={setVideoSeconds}
               disabled={running}
             />
-          )}
+          ) : (
+            <span className="prompt-note" title="该平台的视频接口不支持指定时长，由平台按模型默认时长生成。">
+              时长由平台固定
+            </span>
+          ))}
         </div>
         <div className="prompt-actions">
+          <button
+            type="button"
+            className="secondary-button"
+            title="清空当前输入和生成内容"
+            onClick={clearArena}
+            disabled={running}
+          >清空</button>
           {running ? (
             <button className="secondary-button" onClick={cancel} disabled={!runId}>结束本次运行</button>
           ) : (
-            <button className="primary-button" onClick={run} disabled={(config.activeArenaType === "audio_to_text" ? !audioInput : !prompt.trim()) || !enabledModels.length}>
+            <button className="primary-button" onClick={() => void run()} disabled={!canRun}>
               {{ text: "运行全部模型", image: "生成全部图片", audio: "生成全部音频", audio_to_text: "转写全部音频", video: "生成全部视频" }[config.activeArenaType]}
             </button>
           )}
@@ -1173,55 +1558,20 @@ export default function App() {
       </section>
 
       <section className={`result-grid ${config.activeArenaType === "audio" ? "is-audio-output" : ""}`} aria-label="模型输出">
-        {!loading && enabledModels.map(({ connection, model }) => {
-          const result = results[model.id];
-          const status = result?.status ?? (running ? "running" : "idle");
-          const statusText = {
-            idle: "待运行", running: "生成中", completed: "已完成", failed: "失败", ended: "已结束",
-          }[status];
-          return (
-            <article className="model-card result-card" key={model.id}>
-              <header data-model-name={model.displayName}>
-                <h2
-                  onMouseEnter={(event) => {
-                    event.currentTarget.toggleAttribute(
-                      "data-truncated",
-                      event.currentTarget.scrollWidth > event.currentTarget.clientWidth,
-                    );
-                  }}
-                >
-                  {model.displayName}
-                </h2>
-                <span className={`status status-${status}`}>
-                  <i className="status-dot" aria-hidden="true" />
-                  {statusText}
-                </span>
-              </header>
-              <div className="result-content">
-                {result?.outputText && <p>{result.outputText}</p>}
-                {result?.outputImage && <img src={result.outputImage} alt={`${model.displayName} 生成结果`} />}
-                {result?.outputAudio && <audio src={mediaSrc(result.outputAudio)} controls preload="metadata" />}
-                {result?.outputVideo && <video src={mediaSrc(result.outputVideo)} controls preload="metadata" />}
-                {result?.error && <p className="error-copy" role="alert">{result.error.message}</p>}
-              </div>
-              <footer title={`连接：${connection.displayName}`}>
-                <span>{result && result.status !== "running" ? `${(result.elapsedMs / 1000).toFixed(1)} 秒` : "-- 秒"}</span>
-                {config.activeArenaType !== "audio" && config.activeArenaType !== "audio_to_text" && <>
-                  <span>输入 {metric(result?.usage?.inputTokens)}</span>
-                  <span>输出 {metric(result?.usage?.outputTokens)}</span>
-                  <span>总计 {metric(result?.usage?.totalTokens)}</span>
-                </>}
-                {result?.outputAudio && <button
-                  type="button"
-                  className="download-action"
-                  aria-label={`下载 ${model.displayName} 音频`}
-                  title="下载音频"
-                  onClick={() => downloadAudio(result.outputAudio!, model.displayName)}
-                ><DownloadIcon /></button>}
-              </footer>
-            </article>
-          );
-        })}
+        {!loading && enabledModels.map(({ connection, model }) => (
+          <ResultCard
+            key={model.id}
+            model={model}
+            connectionName={connection.displayName}
+            result={results[model.id]}
+            running={running}
+            showTokenMetrics={config.activeArenaType !== "audio" && config.activeArenaType !== "audio_to_text"}
+            canRegenerate={canRun}
+            onRegenerate={regenerateModel}
+            onCopy={copyResult}
+            onDownloadAudio={downloadAudio}
+          />
+        ))}
         {!loading && !enabledModels.length && (
           <button className="model-card add-card" onClick={() => {
             setSettingsOutputType(config.activeArenaType);
@@ -1403,8 +1753,8 @@ export default function App() {
                           >音频转文本</button>
                         </div>
                         {editor.outputType === "audio_to_text" && <label className="upload-button editor-audio-upload">
-                          ＋ {audioInput ? `测试音频：${audioInput.name}` : "添加测试音频"}
-                          <input type="file" accept={audioFileAccept} onChange={chooseAudioInput} />
+                          ＋ {testAudioInput ? `测试音频：${testAudioInput.name}` : "添加测试音频"}
+                          <input type="file" accept={audioFileAccept} onChange={(event) => void chooseAudioInput(event, setTestAudioInput)} />
                         </label>}
                       </>}
                     </section>
@@ -1537,7 +1887,7 @@ export default function App() {
                       type="button"
                       className="secondary-button"
                       onClick={editor.providerKind === "openai_compatible" ? testCustomModel : () => void loadModels()}
-                      disabled={busy || (editor.outputType === "audio_to_text" && !audioInput)}
+                      disabled={busy || (editor.outputType === "audio_to_text" && !testAudioInput)}
                     >{busy ? "验证中…" : editor.providerKind === "openai_compatible"
                       ? editor.outputType === "image" ? "测试连接（生成 1 张图）"
                         : editor.outputType === "audio" ? "测试连接（生成短音频）"

@@ -1,6 +1,6 @@
 [package]
 name = "model-battle"
-version = "1.0.2"
+version = "1.1.0"
 description = "本地优先的多模型对比工具"
 authors = ["Model Battle contributors"]
 edition = "2024"
