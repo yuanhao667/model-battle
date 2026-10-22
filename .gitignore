@@ -44,3 +44,22 @@ test-results
 *.njsproj
 *.sln
 *.sw?
+
+# Local documentation and review captures (never include in feature commits)
+/doc/
+/doc./
+/docs/
+/review-artifacts/
+*.[mM][dD]
+*.[mM][aA][rR][kK][dD][oO][wW][nN]
+*.mdx
+
+# Selection credentials, local history, and machine-specific state
+selection-driver*.json
+selection-history*
+config.local*.json
+config.json
+config.backup*.json
+/.aws/
+/.codex/
+/.agents/

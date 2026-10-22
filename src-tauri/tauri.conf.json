@@ -44,6 +44,9 @@
       "icons/128x128@2x.png",
       "icons/icon.icns",
       "icons/icon.ico"
-    ]
+    ],
+    "resources": {
+      "src/selection/THIRD_PARTY_NOTICES.txt": "THIRD_PARTY_NOTICES.txt"
+    }
   }
 }
