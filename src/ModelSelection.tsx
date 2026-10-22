@@ -3,11 +3,15 @@ import modelBattleLogo from "../src-tauri/icons/128x128.png";
 import SelectionResearch from "./SelectionResearch";
 import SelectionDriverSettings from "./SelectionDriverSettings";
 import {
-  AssistantSettings, ConversationSummary, ConversationView, emptyTask, FieldKey, RequirementCard,
+  ASSISTANT_CONTEXT_TOKENS, ASSISTANT_MODEL_LABEL, DEFAULT_ASSISTANT_MODEL, AssistantSettings, ConversationSummary, ConversationView, SelectionWorkspace, emptyTask, FieldKey, RequirementCard,
   prefillSuggestions, priorityOptions, selectedPriorities, priorityLabel, requirementFields, selectionContextFields, selectionApi, selectionError, SelectionSession, taskTypes, userScenarioValue,
 } from "./selection";
 
 type EditableConcern = { label: string; selected: boolean };
+
+function PinIcon() {
+  return <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M9 3h6M10 3v5l-4 4v3h12v-3l-4-4V3M12 15v6" /></svg>;
+}
 
 function resizeContextField(field: HTMLTextAreaElement | null) {
   if (!field) return;
@@ -33,6 +37,7 @@ export default function ModelSelection({ hidden, assistant, onAssistantSaved, on
   const [intentId, setIntentId] = useState("");
   const [busy, setBusy] = useState<"loading" | "extracting" | "confirming" | "researching" | "switching" | "">("loading");
   const busyRef = useRef(false);
+  const ratingAttempts = useRef(new Set<string>());
   const confirmationRef = useRef<{ signature: string; requestId: string } | undefined>(undefined);
   const [error, setError] = useState("");
   const [notice, setNotice] = useState("");
@@ -50,6 +55,16 @@ export default function ModelSelection({ hidden, assistant, onAssistantSaved, on
   const silentSeconds = modelWaitSince ? Math.max(0, Math.floor((now - modelWaitSince) / 1000)) : 0;
   const landing = !card && intents.length === 0 && messages.length === 0 && !session?.running;
   const connected = Boolean(assistant?.hasCredential);
+  const metrics = session?.metrics;
+  const invocation = metrics?.latest ?? session?.invocation;
+  const usage = invocation?.usage;
+  const measuredCalls = metrics?.usageCalls ?? (usage?.totalTokens != null ? 1 : 0);
+  const calls = metrics?.completedCalls || (invocation ? 1 : 0);
+  const tokens = metrics?.usageCalls ? metrics.totalTokens : usage?.totalTokens;
+  const contextTokens = usage?.totalTokens ?? (usage?.inputTokens != null && usage?.outputTokens != null ? usage.inputTokens + usage.outputTokens : undefined);
+  const contextPercent = invocation?.modelId === DEFAULT_ASSISTANT_MODEL && contextTokens != null ? Math.min(100, Math.max(0, contextTokens * 100 / ASSISTANT_CONTEXT_TOKENS)) : undefined;
+  const contextLabel = contextPercent == null ? "—" : contextPercent > 0 && contextPercent < 0.1 ? "<0.1" : Number(contextPercent.toFixed(1)).toString();
+  const compactTokens = (value: number) => new Intl.NumberFormat("en", { notation: "compact", maximumFractionDigits: 1 }).format(value);
 
   function applySession(value: SelectionSession) {
     setNewConcern(null);
@@ -69,6 +84,14 @@ export default function ModelSelection({ hidden, assistant, onAssistantSaved, on
     return { card: card ?? null, description, messages, editing };
   }
 
+  function applyWorkspace(workspace: SelectionWorkspace) {
+    applySession(workspace.session);
+    setDescription(""); setMessages(workspace.session.description ? [workspace.session.description] : []);
+    restoreView(workspace.view);
+    setConversations(workspace.conversations);
+    confirmationRef.current = undefined; setNotice(""); setHistoryError("");
+  }
+
   async function load() {
     setBusy("loading"); setError("");
     try {
@@ -83,6 +106,18 @@ export default function ModelSelection({ hidden, assistant, onAssistantSaved, on
   }
 
   useEffect(() => { void load(); }, []);
+  useEffect(() => {
+    const result = activeRun?.research;
+    if (!hidden && connected && confirmed && !busy && !working && session && activeTask && result?.needsRatings) {
+      const recovering = Boolean(result.ratingAttempted && !result.ratingError);
+      const recoveryKey = `${session.id}:${session.revision}:${activeTask.id}:${result.report?.groups[0]?.candidates.length}:recovery`;
+      if (recovering) {
+        if (ratingAttempts.current.has(recoveryKey)) return;
+        ratingAttempts.current.add(recoveryKey);
+      }
+      if (!result.ratingAttempted || recovering) void rateCandidates(recovering);
+    }
+  }, [hidden, connected, confirmed, busy, working, session?.id, session?.revision, activeRun?.research?.needsRatings, activeRun?.research?.ratingAttempted, activeRun?.research?.ratingError]);
   useEffect(() => {
     if (!session || busy || working) return;
     let disposed = false;
@@ -215,6 +250,35 @@ export default function ModelSelection({ hidden, assistant, onAssistantSaved, on
     finally { busyRef.current = false; setBusy(""); }
   }
 
+  async function moreCandidates() {
+    if (!session || !activeTask || busyRef.current || activeRun?.research?.moreRequested) return;
+    busyRef.current = true; setBusy("researching"); setError("");
+    setWaitingStartedAt(Date.now()); setNow(Date.now());
+    setSession({ ...session, progress: { message: "正在查找另外 5 个适合的模型…", startedAtMs: Date.now() } });
+    try { applySession(await selectionApi.research(session.id, session.revision, activeTask.id, false, true)); }
+    catch (cause) {
+      setError(selectionError(cause));
+      try { setSession(await selectionApi.get()); } catch { /* 不自动重发可能已计费的补充请求。 */ }
+    }
+    finally { busyRef.current = false; setBusy(""); }
+  }
+
+  async function rateCandidates(retry = true) {
+    if (!session || !activeTask || busyRef.current || working) return;
+    const key = `${session.id}:${session.revision}:${activeTask.id}:${activeRun?.research?.report?.groups[0]?.candidates.length}`;
+    if (!retry && ratingAttempts.current.has(key)) return;
+    ratingAttempts.current.add(key);
+    busyRef.current = true; setBusy("researching"); setError("");
+    setWaitingStartedAt(Date.now()); setNow(Date.now());
+    setSession({ ...session, progress: { message: "正在按需求卡更新推荐星级…", startedAtMs: Date.now() } });
+    try { setSession(await selectionApi.rate(session.id, session.revision, activeTask.id, retry)); }
+    catch (cause) {
+      setError(selectionError(cause));
+      try { setSession(await selectionApi.get()); } catch { /* 保留名单，不自动重发已尝试的评级请求。 */ }
+    }
+    finally { busyRef.current = false; setBusy(""); }
+  }
+
   async function selectIntent(taskId: string) {
     if (!session || busyRef.current) return;
     busyRef.current = true; setBusy("confirming"); setError("");
@@ -228,11 +292,19 @@ export default function ModelSelection({ hidden, assistant, onAssistantSaved, on
     busyRef.current = true; setBusy("switching"); setError("");
     try {
       const workspace = await selectionApi.openConversation(session.id, session.revision, currentView(), targetId);
-      applySession(workspace.session);
-      setDescription(""); setMessages(workspace.session.description ? [workspace.session.description] : []);
-      restoreView(workspace.view);
-      setConversations(workspace.conversations);
-      confirmationRef.current = undefined; setNotice(""); setHistoryError("");
+      applyWorkspace(workspace);
+    } catch (cause) { setError(selectionError(cause)); }
+    finally { busyRef.current = false; setBusy(""); }
+  }
+
+  async function manageConversation(item: ConversationSummary, remove = false) {
+    if (!session || busyRef.current || working) return;
+    busyRef.current = true; setBusy("switching"); setError("");
+    try {
+      const workspace = remove
+        ? await selectionApi.deleteConversation(session.id, session.revision, currentView(), item.id)
+        : await selectionApi.pinConversation(session.id, session.revision, currentView(), item.id, !item.pinned);
+      applyWorkspace(workspace);
     } catch (cause) { setError(selectionError(cause)); }
     finally { busyRef.current = false; setBusy(""); }
   }
@@ -241,7 +313,13 @@ export default function ModelSelection({ hidden, assistant, onAssistantSaved, on
     <aside className="selection-sidebar" aria-label="选型对话列表">
       <button className="secondary-button selection-new-conversation" disabled={Boolean(busy) || working || !session} onClick={() => void openConversation()}>＋ 新建选型</button>
       <p className="selection-sidebar-title">选型对话</p>
-      <nav aria-label="历史选型">{conversations.map((item) => <button key={item.id} title={item.title} className={session?.id === item.id ? "is-active" : ""} aria-current={session?.id === item.id ? "page" : undefined} disabled={Boolean(busy) || working} onClick={() => void openConversation(item.id)}>{item.id === session?.id ? activeTask?.name || item.title : item.title}</button>)}</nav>
+      <nav aria-label="历史选型">{conversations.map((item) => <div className={`selection-conversation-row${session?.id === item.id ? " is-active" : ""}`} key={item.id}>
+        <button className="selection-conversation-open" title={item.title} aria-current={session?.id === item.id ? "page" : undefined} disabled={Boolean(busy) || working} onClick={() => void openConversation(item.id)}>{item.pinned && <PinIcon />}<span>{item.id === session?.id ? activeTask?.name || item.title : item.title}</span></button>
+        <div className="selection-conversation-actions">
+          <button type="button" title={item.pinned ? "取消置顶" : "置顶对话"} aria-label={`${item.pinned ? "取消置顶" : "置顶对话"} ${item.title}`} aria-pressed={Boolean(item.pinned)} disabled={Boolean(busy) || working} onClick={() => void manageConversation(item)}><PinIcon /></button>
+          <button type="button" className="selection-conversation-delete" title="删除对话" aria-label={`删除对话 ${item.title}`} disabled={Boolean(busy) || working} onClick={() => void manageConversation(item, true)}><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 7h16M9 7V4h6v3M6 7l1 14h10l1-14M10 11v6m4-6v6" /></svg></button>
+        </div>
+      </div>)}</nav>
       {historyError && <p className="selection-history-error" role="alert">{historyError}</p>}
     </aside>
     <section className={`selection-page${landing ? " is-landing" : ""}`} aria-label="模型选型">
@@ -290,7 +368,7 @@ export default function ModelSelection({ hidden, assistant, onAssistantSaved, on
             if (key === "businessContext" && (!field.value || field.value === sharedContext)) return null;
             if (["accuracy", "speed"].includes(key)) return field.value ? <div className="selection-recognized-condition" key={key}><span>{label}</span><p>{field.value}</p>{!confirmed && <button className="text-button" disabled={Boolean(busy) || confirmed} aria-label={`清除任务 ${taskIndex + 1} 的${label}要求`} onClick={() => changeField(taskIndex, key, "")}>清除</button>}</div> : null;
             if (key === "fallback" && !field.value) return null;
-            return <div className={`requirement-field ${key === "taskType" ? "is-task-type" : key === "businessGoal" ? "is-business-goal" : key === "taskDifficulty" ? "is-difficulty" : key === "taskFocus" ? "is-task-focus" : ""}`} key={key}>
+            return <div className={`requirement-field ${key === "taskType" ? "is-task-type" : key === "businessContext" ? "is-business-context" : key === "businessGoal" ? "is-business-goal" : key === "taskDifficulty" ? "is-difficulty" : key === "taskFocus" ? "is-task-focus" : ""}`} key={key}>
               {key === "taskDifficulty" ? <span className="requirement-label">{label}</span> : <label className="requirement-label" htmlFor={`selection-${task.id}-${key}`}>{label}</label>}
                 {key === "taskType" ? <span className="selection-task-types">{taskTypes.map((type) => <label key={type}><input type="checkbox" aria-label={`任务 ${taskIndex + 1}：${type}`} disabled={Boolean(busy) || confirmed} checked={field.value.split("、").map((value) => value.trim()).includes(type)} onChange={(event) => {
                   const values = field.value.split("、").map((value) => value.trim()).filter(Boolean).filter((value) => value !== type);
@@ -303,14 +381,13 @@ export default function ModelSelection({ hidden, assistant, onAssistantSaved, on
       </article>; })}
       </section>
       {!confirmed && <div className="selection-bottom-actions">
-        <button className="secondary-button" type="button" disabled={Boolean(busy) || confirmed} onClick={() => void openConversation()}>重新描述</button>
         <button className="primary-button" type="button" disabled={Boolean(busy) || confirmed || card.tasks.some((task) => !task.name.trim())} onClick={() => void confirm()}>{busy === "confirming" ? "确认中…" : "确认并开始选型"}</button>
       </div>}
     </div>}
       {confirmed && card && <div className="selection-assistant-message">
         <section role="region" aria-label={`${activeTask?.name} 推荐结果`}>
           <div className="selection-confirmed"><p>{activeTask?.name}</p><button className="secondary-button" onClick={() => { setEditing(true); setNotice(""); }} disabled={Boolean(busy)}>修改需求</button></div>
-          {activeRun?.research && <SelectionResearch result={activeRun.research} card={card} busy={Boolean(busy) || working} onRetry={() => void retryResearch()} onSettings={onOpenSettings} />}
+          {activeRun?.research && <SelectionResearch result={activeRun.research} card={card} busy={Boolean(busy) || working} onRetry={() => void retryResearch()} onMore={() => void moreCandidates()} onRate={() => void rateCandidates()} onSettings={onOpenSettings} />}
           {!activeRun?.research && !busy && <button className="primary-button" onClick={() => void retryResearch()}>开始调研</button>}
         </section>
       </div>}
@@ -324,9 +401,14 @@ export default function ModelSelection({ hidden, assistant, onAssistantSaved, on
     {session?.storageError && <p className="selection-error" role="alert">{session.storageError}</p>}
     {notice && <p className="selection-notice" role="status">{notice}</p>}
 
-    {connected ? <section className="prompt-card selection-composer" aria-label="描述需求">
+    {connected ? <div className="selection-composer-area"><section className="prompt-card selection-composer" aria-label="描述需求">
         <textarea ref={composerRef} aria-label="你希望 AI 完成什么工作？" value={description} maxLength={20000} disabled={Boolean(busy) || Boolean(session?.running)} onChange={(event) => setDescription(event.target.value)} placeholder={card ? `补充或修改「${activeTask?.name ?? "当前任务"}」的需求…` : "简要描述业务背景、目标用户、使用场景，以及一个 AI 环节的工作、输入和输出；每次只为一个环节选模型。"} rows={4} onKeyDown={(event) => { if (event.key === "Enter" && (event.metaKey || event.ctrlKey) && !event.nativeEvent.isComposing) { event.preventDefault(); void extract(); } }} />
-        <div className="prompt-actions"><button className="primary-button" type="button" aria-label="发送需求" disabled={Boolean(busy) || !session || Boolean(session.running) || !description.trim()} onClick={() => void extract()}>{busy === "extracting" ? "识别中…" : "发送"}</button></div>
-    </section> : <SelectionDriverSettings assistant={assistant} onSaved={onAssistantSaved} inline />}
+        <div className="prompt-actions"><span className="selection-composer-model">{ASSISTANT_MODEL_LABEL}</span><button className="primary-button" type="button" aria-label="发送需求" disabled={Boolean(busy) || !session || Boolean(session.running) || !description.trim()} onClick={() => void extract()}>{busy === "extracting" ? "识别中…" : "发送"}</button></div>
+    </section>
+      {!landing && <div className="selection-usage" role="group" aria-label="对话用量统计">
+        <span title={`当前对话发送轮次及已返回内容的模型调用次数（含补全和重试，不含网页工具）；累计 Token 包含输入、输出及思考，${measuredCalls}/${calls} 次调用返回用量。`}><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M5 19a9 9 0 1 1 14 0M12 12l4-4M5 8l1 1m6-6v2m7 3-1 1" /><circle cx="12" cy="12" r="1" /></svg>{messages.length} 轮 · {calls} 次调用 · {tokens == null ? "— tok" : `${measuredCalls < calls ? "已统计 " : ""}${compactTokens(tokens)} tok`}</span>
+        <span role="progressbar" aria-label="上下文占用" aria-valuemin={0} aria-valuemax={100} aria-valuenow={contextPercent} aria-valuetext={contextPercent == null ? "未返回用量" : `${contextLabel}%`} title="最近一次已完成调用的输入与输出 Token 总量 ÷ 模型上下文容量（官方规格 1M），不累加历次调用。"><svg className="selection-context-ring" viewBox="0 0 24 24" aria-hidden="true"><circle cx="12" cy="12" r="9" className="selection-context-track" />{contextPercent != null && contextPercent > 0 && <circle cx="12" cy="12" r="9" pathLength="100" strokeDasharray={`${contextPercent} 100`} />}</svg>上下文占用 {contextLabel}%</span>
+      </div>}
+    </div> : <SelectionDriverSettings assistant={assistant} onSaved={onAssistantSaved} inline />}
   </section></div>;
 }

@@ -59,6 +59,7 @@ selection-driver*.json
 selection-history*
 config.local*.json
 config.json
+config.backup*.json
 /.aws/
 /.codex/
 /.agents/

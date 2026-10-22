@@ -160,6 +160,58 @@ describe("model selection", () => {
     expect(input).toHaveValue("");
   });
 
+  it("shows the driver by Send and displays real per-conversation metrics after entering chat", async () => {
+    const user = userEvent.setup();
+    const draft = card();
+    const latest = { modelId: DEFAULT_ASSISTANT_MODEL, connectionName: "DeepSeek", elapsedMs: 3000, firstTokenMs: 1000, usage: { inputTokens: 40000, outputTokens: 10000, totalTokens: 50000, cachedInputTokens: 960 } };
+    invoke.mockImplementation((command: string) => Promise.resolve(command === "selection_extract" ? {
+      ...initial(), revision: 1, description: draft.description, draft, invocation: latest,
+      metrics: { completedCalls: 2, usageCalls: 2, totalTokens: 100000, cacheHitTokens: 1920, cacheInputTokens: 2000, latest },
+    } : initial()));
+    mount();
+    const send = screen.getByRole("button", { name: "发送需求" });
+    expect(send.previousElementSibling).toHaveTextContent("DeepSeek V4.1 Flash");
+    expect(screen.queryByRole("group", { name: "对话用量统计" })).not.toBeInTheDocument();
+    const input = screen.getByRole("textbox", { name: "你希望 AI 完成什么工作？" });
+    await waitFor(() => expect(input).toBeEnabled());
+    await user.type(input, draft.description);
+    await user.click(send);
+    const stats = await screen.findByRole("group", { name: "对话用量统计" });
+    await waitFor(() => expect(stats).toHaveTextContent("1 轮 · 2 次调用 · 100K tok"));
+    expect(within(stats).getByRole("progressbar", { name: "上下文占用" })).toHaveAttribute("aria-valuenow", "5");
+    expect(stats).toHaveTextContent("5%");
+    expect(stats.children).toHaveLength(2);
+    expect(stats).not.toHaveTextContent(/tok\/s|缓存命中|本次输入|秒/);
+    expect(send.previousElementSibling).toHaveTextContent("DeepSeek V4.1 Flash");
+    expect(stats.parentElement).toContainElement(input.closest(".selection-composer"));
+  });
+
+  it("keeps unavailable context unknown and shows partial totals without rounding small usage to zero", async () => {
+    const draft = card();
+    const latest = { modelId: DEFAULT_ASSISTANT_MODEL, connectionName: "DeepSeek", elapsedMs: 1000, usage: { inputTokens: 100, outputTokens: 10, totalTokens: 110, cachedInputTokens: 0 } };
+    invoke.mockResolvedValue({ ...initial(), description: draft.description, draft, metrics: { completedCalls: 2, usageCalls: 1, totalTokens: 110, cacheHitTokens: 0, cacheInputTokens: 100, latest } });
+    mount();
+    const stats = await screen.findByRole("group", { name: "对话用量统计" });
+    expect(stats).toHaveTextContent("已统计 110 tok");
+    expect(stats).toHaveTextContent("<0.1%");
+    cleanup();
+    invoke.mockResolvedValue({ ...initial(), description: draft.description, draft });
+    mount();
+    const missing = await screen.findByRole("group", { name: "对话用量统计" });
+    expect(missing).toHaveTextContent("— tok");
+    expect(missing).toHaveTextContent("—%");
+    expect(within(missing).getByRole("progressbar")).not.toHaveAttribute("aria-valuenow");
+  });
+
+  it.each([[0, 0], [1500000, 100]])("bounds the context ring for %s tokens", async (totalTokens, percent) => {
+    const draft = card();
+    invoke.mockResolvedValue({ ...initial(), description: draft.description, draft, invocation: { modelId: DEFAULT_ASSISTANT_MODEL, connectionName: "DeepSeek", elapsedMs: 1000, usage: { totalTokens } } });
+    mount();
+    const ring = await screen.findByRole("progressbar", { name: "上下文占用" });
+    expect(ring).toHaveAttribute("aria-valuenow", String(percent));
+    expect(ring).toHaveTextContent(`${percent}%`);
+  });
+
   it("keeps the existing card and submits optional budget and model requirements", async () => {
     const user = userEvent.setup();
     const draft = card();
@@ -245,7 +297,7 @@ describe("model selection", () => {
     expect(await screen.findByText("确认暂时失败")).toBeVisible();
     expect(goal).toHaveValue("提高整理效率");
     await user.click(screen.getByRole("button", { name: "确认并开始选型" }));
-    expect(await screen.findByRole("button", { name: "重新调研" })).toBeVisible();
+    expect(await screen.findByRole("button", { name: "重试生成" })).toBeVisible();
     expect(invoke.mock.calls.filter(([command]) => command === "research_command")).toHaveLength(1);
     expect(screen.getByText("资料服务暂不可用")).toBeVisible();
     const requests = invoke.mock.calls.filter(([command]) => command === "selection_confirm");
@@ -312,7 +364,7 @@ describe("model selection", () => {
     expect(screen.queryByRole("link", { name: "DeepSeek 模型与价格" })).not.toBeInTheDocument();
     if (status === "failed") {
       expect(screen.getByRole("alert")).toHaveTextContent("资料不足，未生成候选。");
-      expect(screen.getByRole("button", { name: "重新调研" })).toBeVisible();
+      expect(screen.getByRole("button", { name: "重试生成" })).toBeVisible();
     }
   });
 
@@ -397,7 +449,7 @@ describe("model selection", () => {
     expect(within(screen.getByRole("region", { name: "选型调研" })).getByText("业务优先级").compareDocumentPosition(model) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
     expect(screen.queryByText(/暂未找到有依据|没有业务样本|请先提供专业指标/)).not.toBeInTheDocument();
     expect(within(screen.getByRole("region", { name: "选型调研" })).queryByRole("radio")).not.toBeInTheDocument();
-    expect(screen.getByRole("img", { name: "AI 第一推荐的主力模型" })).toBeVisible();
+    expect(screen.getByRole("img", { name: "主力模型：待评级" })).toBeVisible();
     expect(screen.queryByRole("button", { name: "选用此模型" })).not.toBeInTheDocument();
   });
 
@@ -679,7 +731,7 @@ describe("model selection", () => {
     expect(screen.getByRole("textbox", { name: "任务 1：模型要求" })).toHaveValue(expected);
   });
 
-  it("keeps all priorities from older cards and omits model labels", async () => {
+  it("keeps all priorities from older cards and shows the driver beside Send", async () => {
     const draft = card();
     draft.tasks[0].fields.priorities = { value: "准确性 > 速度 > 成本", source: "provided", evidence: "准确性、速度、成本" };
     invoke.mockResolvedValue({ ...initial(), draft, invocation: { modelId: DEFAULT_ASSISTANT_MODEL, connectionName: "test", elapsedMs: 1 } });
@@ -688,7 +740,7 @@ describe("model selection", () => {
     expect(within(priorities).getByRole("checkbox", { name: "准确性" })).toBeChecked();
     expect(within(priorities).getByRole("checkbox", { name: "速度" })).toBeChecked();
     expect(within(priorities).getByRole("checkbox", { name: "成本" })).toBeEnabled();
-    expect(screen.queryByText("DeepSeek V4.1 Flash")).not.toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "发送需求" }).previousElementSibling).toHaveTextContent("DeepSeek V4.1 Flash");
     expect(screen.queryByText(/整理模型/)).not.toBeInTheDocument();
     expect(screen.queryByRole("heading", { name: "模型选型" })).not.toBeInTheDocument();
   });
@@ -824,7 +876,7 @@ describe("model selection", () => {
       if (command === "research_command") current = { ...current, taskRuns: { [args.taskId]: { selectedModel: null, fallbackModel: null, research: { status: "complete", revision: 1, researchedAtMs: new Date("2026-10-22T12:00:00").getTime(), sources: [
         { id: "board", area: "ranking", title: "同一份文本榜", url: "https://example.com/leaderboard", status: "read", checkedAtMs: 1, error: "" },
         { id: "docs", area: "capabilities", title: "模型能力文档", url: "https://example.com/docs", status: "read", checkedAtMs: 1, error: "" },
-      ], error: "", report: { findings: [], groups: [{ taskId: args.taskId, leaderboard: { sourceId: "board", quote: "Text leaderboard" }, candidates: Array.from({ length: 6 }, (_, index) => ({ model: `model-${index}`, origin: index < 3 ? "china" : "overseas", displayName: `当前模型 ${index + 1}`, role: index === 3 ? "main" : index === 5 ? "fallback" : "candidate", mainRank: index === 3 ? 1 : index === 2 ? 2 : 0, fallbackRank: index === 5 ? 1 : index === 4 ? 2 : 0, reason: `任务适配理由 ${index + 1}`, apiUrl: "https://example.com/api", evidence: [{ sourceId: "docs", quote: "supports structured output" }], test: "验证任务", gaps: [] })), suitableModels: [{ model: "older-model", origin: "china", displayName: "已检索的旧版本", reason: "接受录音，输出转写文本", evidence: [{ sourceId: "docs", quote: "supports transcription" }] }], gaps: [] }], questions: [] } } } } };
+      ], error: "", report: { findings: [], groups: [{ taskId: args.taskId, leaderboard: { sourceId: "board", quote: "Text leaderboard" }, candidates: Array.from({ length: 6 }, (_, index) => ({ model: `model-${index}`, origin: index < 3 ? "china" : "overseas", displayName: `当前模型 ${index + 1}`, role: index === 3 ? "main" : index === 5 ? "fallback" : "candidate", mainRank: index === 3 ? 1 : index === 2 ? 2 : 0, fallbackRank: index === 5 ? 1 : index === 4 ? 2 : 0, mainStars: index === 3 ? 3 : index === 2 ? 2 : 1, fallbackStars: index === 5 ? 3 : index === 4 ? 2 : 1, reason: `任务适配理由 ${index + 1}`, apiUrl: "https://example.com/api", evidence: [{ sourceId: "docs", quote: "supports structured output" }], test: "验证任务", gaps: [] })), suitableModels: [{ model: "older-model", origin: "china", displayName: "已检索的旧版本", reason: "接受录音，输出转写文本", evidence: [{ sourceId: "docs", quote: "supports transcription" }] }], gaps: [] }], questions: [] } } } } };
 
       return Promise.resolve(current);
     });
@@ -847,24 +899,23 @@ describe("model selection", () => {
     expect(screen.getByText("主力模型")).toHaveTextContent("主力模型（性价比更高）");
     expect(screen.getByText("兜底模型")).toHaveTextContent("兜底模型（质量更好）");
     expect(screen.queryByText("AI 最推荐 · 主力模型")).not.toBeInTheDocument();
-    expect(screen.getAllByRole("img", { name: "AI 第一推荐的主力模型" })).toHaveLength(1);
-    expect(screen.getAllByRole("img", { name: "AI 第一推荐的兜底模型" })).toHaveLength(1);
-    expect(screen.getByRole("img", { name: "AI 第一推荐的主力模型" }).closest("article")).toHaveTextContent("当前模型 4");
-    expect(screen.getByRole("img", { name: "AI 第一推荐的兜底模型" }).closest("article")).toHaveTextContent("当前模型 6");
-    expect(screen.getByRole("img", { name: "AI 第一推荐的主力模型" }).querySelector("path")).toHaveAttribute("fill", "#000");
+    expect(screen.getAllByRole("img", { name: "主力模型推荐程度：3 星" })).toHaveLength(1);
+    expect(screen.getAllByRole("img", { name: "兜底模型推荐程度：3 星" })).toHaveLength(1);
+    expect(screen.getByRole("img", { name: "主力模型推荐程度：3 星" }).closest("article")).toHaveTextContent("当前模型 4");
+    expect(screen.getByRole("img", { name: "兜底模型推荐程度：3 星" }).closest("article")).toHaveTextContent("当前模型 6");
+    expect(screen.getByRole("img", { name: "主力模型推荐程度：3 星" }).querySelector("path")).toHaveAttribute("fill", "#000");
     const unselectedRow = screen.getByRole("heading", { name: /^当前模型 1 / }).closest("article")!;
-    expect(within(unselectedRow).getByRole("img", { name: "未推荐为主力模型" }).querySelector("path")).toHaveAttribute("fill", "#d5d5d5");
-    expect(within(unselectedRow).getByRole("img", { name: "未推荐为兜底模型" }).querySelector("path")).toHaveAttribute("fill", "#d5d5d5");
-    expect(screen.getAllByRole("img", { name: /^未推荐为/ })).toHaveLength(10);
-    const mainSecond = screen.getByRole("img", { name: "AI 第二推荐的主力模型" });
-    const fallbackSecond = screen.getByRole("img", { name: "AI 第二推荐的兜底模型" });
+    expect(Array.from(within(unselectedRow).getByRole("img", { name: "主力模型推荐程度：1 星" }).querySelectorAll("path")).map((path) => path.getAttribute("fill"))).toEqual(["#000", "#d5d5d5", "#d5d5d5"]);
+    expect(Array.from(within(unselectedRow).getByRole("img", { name: "兜底模型推荐程度：1 星" }).querySelectorAll("path")).map((path) => path.getAttribute("fill"))).toEqual(["#000", "#d5d5d5", "#d5d5d5"]);
+    expect(screen.getAllByRole("img", { name: /推荐程度：1 星$/ })).toHaveLength(8);
+    const mainSecond = screen.getByRole("img", { name: "主力模型推荐程度：2 星" });
+    const fallbackSecond = screen.getByRole("img", { name: "兜底模型推荐程度：2 星" });
     expect(mainSecond.closest("article")).toHaveTextContent("当前模型 3");
     expect(fallbackSecond.closest("article")).toHaveTextContent("当前模型 5");
     for (const icon of [mainSecond, fallbackSecond]) {
-      expect(icon.querySelector("path")!.getAttribute("fill")).toMatch(/^url\(#/);
-      expect(Array.from(icon.querySelectorAll("stop")).map((stop) => [stop.getAttribute("offset"), stop.getAttribute("stop-color")])).toEqual([["50%", "#000"], ["50%", "#d9d9d9"]]);
+      expect(Array.from(icon.querySelectorAll("path")).map((path) => path.getAttribute("fill"))).toEqual(["#000", "#000", "#d5d5d5"]);
+      expect(icon.querySelector("linearGradient")).toBeNull();
     }
-    expect(mainSecond.querySelector("linearGradient")!.id).not.toBe(fallbackSecond.querySelector("linearGradient")!.id);
     const title = screen.getByRole("heading", { name: "入围模型（7 个）" });
     expect(within(screen.getByRole("region", { name: "选型调研" })).getByText("业务优先级").compareDocumentPosition(title) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
     expect(screen.getByText("任务适配理由 6").compareDocumentPosition(screen.getByText("检索日期：2026/10/22")) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
@@ -872,8 +923,8 @@ describe("model selection", () => {
     await user.click(screen.getByRole("button", { name: "前往模型配置" }));
     expect(await screen.findByRole("heading", { name: "模型 Battle AI" })).toBeVisible();
     await user.click(screen.getByRole("button", { name: "模型选型" }));
-    expect(screen.getByRole("img", { name: "AI 第一推荐的主力模型" }).closest("article")).toHaveTextContent("当前模型 4");
-    expect(screen.getByRole("img", { name: "AI 第一推荐的兜底模型" }).closest("article")).toHaveTextContent("当前模型 6");
+    expect(screen.getByRole("img", { name: "主力模型推荐程度：3 星" }).closest("article")).toHaveTextContent("当前模型 4");
+    expect(screen.getByRole("img", { name: "兜底模型推荐程度：3 星" }).closest("article")).toHaveTextContent("当前模型 6");
     expect(invoke.mock.calls.filter(([command]) => command === "selection_choose")).toHaveLength(0);
     expect(invoke.mock.calls.filter(([command]) => command === "research_command").map(([, args]) => args.taskId)).toEqual([draft.tasks[0].id]);
     expect(invoke.mock.calls.find(([command]) => command === "research_command")![1].asOfDate).toMatch(/^\d{4}-\d{2}-\d{2}$/);
@@ -946,7 +997,7 @@ describe("model selection", () => {
     expect(screen.queryByText(/清空本轮/)).not.toBeInTheDocument();
     expect(invoke.mock.calls.filter(([command]) => ["selection_reset", "selection_extract", "research_command"].includes(command))).toHaveLength(0);
     const history = screen.getByRole("navigation", { name: "历史选型" });
-    expect(within(history).getAllByRole("button")).toHaveLength(2);
+    expect(within(history).getAllByRole("button")).toHaveLength(6);
     await user.click(within(history).getByRole("button", { name: "会议转写" }));
     expect(await screen.findByText("old-model")).toBeVisible();
     expect(input).toHaveValue("保留这段未发送的补充");
@@ -967,6 +1018,98 @@ describe("model selection", () => {
     await waitFor(() => expect(invoke).toHaveBeenCalledWith("selection_conversation_save", expect.objectContaining({ sessionId: "session", view: expect.objectContaining({ description: "尚未发送的文字" }) })));
   });
 
+  it("pins, unpins and deletes conversations without triggering a conversation-open click", async () => {
+    const user = userEvent.setup();
+    let current = { ...initial(), draft: card() };
+    let items = [{ id: "other", title: "其他选型", updatedAtMs: 2, pinned: false }, { id: "session", title: "会议转写", updatedAtMs: 1, pinned: false }];
+    invoke.mockImplementation((command: string, args: any) => {
+      if (command === "selection_conversations") return Promise.resolve({ view: null, conversations: items });
+      if (command === "selection_conversation_save") return Promise.resolve(items);
+      if (command === "selection_conversation_pin") {
+        items = items.map((item) => item.id === args.targetId ? { ...item, pinned: args.pinned } : item).sort((a, b) => Number(b.pinned) - Number(a.pinned));
+        return Promise.resolve({ session: current, view: args.view, conversations: items });
+      }
+      if (command === "selection_conversation_delete") {
+        items = items.filter((item) => item.id !== args.targetId);
+        current = { ...initial(), id: "other", draft: null as any };
+        return Promise.resolve({ session: current, view: { card: null, description: "其他对话的草稿", messages: [], editing: true }, conversations: items });
+      }
+      return Promise.resolve(current);
+    });
+    mount();
+    const pin = await screen.findByRole("button", { name: "置顶对话 会议转写" });
+    await user.hover(pin.closest(".selection-conversation-row")!);
+    await user.click(pin);
+    expect(await screen.findByRole("button", { name: "取消置顶 会议转写" })).toHaveAttribute("aria-pressed", "true");
+    const history = screen.getByRole("navigation", { name: "历史选型" });
+    expect(history.firstElementChild).toHaveTextContent("会议转写");
+    await user.click(screen.getByRole("button", { name: "取消置顶 会议转写" }));
+    expect(await screen.findByRole("button", { name: "置顶对话 会议转写" })).toHaveAttribute("aria-pressed", "false");
+    await user.click(screen.getByRole("button", { name: "删除对话 会议转写" }));
+    await waitFor(() => expect(screen.queryByRole("button", { name: "删除对话 会议转写" })).not.toBeInTheDocument());
+    expect(screen.getByRole("textbox", { name: "你希望 AI 完成什么工作？" })).toHaveValue("其他对话的草稿");
+    expect(invoke.mock.calls.filter(([command]) => command === "selection_conversation_open")).toHaveLength(0);
+  });
+
+  it("appends five models only once and still disables the action after restoring the conversation", async () => {
+    const user = userEvent.setup();
+    const draft = card();
+    const models = Array.from({ length: 10 }, (_, index) => ({ model: `original-${index}`, reason: "原有推荐理由", role: "candidate", mainStars: index < 3 ? 3 : 2, fallbackStars: index < 3 ? 2 : 3, evidence: [], test: "", gaps: [] }));
+    let current: SelectionSession = { ...initial(), revision: 1, draft, confirmed: { card: draft, revision: 1, confirmedAtMs: 1 }, taskRuns: { [draft.tasks[0].id]: { selectedModel: "original-0", research: { status: "complete", revision: 1, sources: [], error: "", report: { findings: [], questions: [], groups: [{ taskId: draft.tasks[0].id, candidates: models, gaps: [] }] } } } } };
+    invoke.mockImplementation((command: string, args: any) => {
+      if (command === "research_command" && args.more) {
+        const result = current.taskRuns![draft.tasks[0].id].research!;
+        current = { ...current, taskRuns: { [draft.tasks[0].id]: { selectedModel: "original-0", research: { ...result, moreRequested: true, moreAddedCount: 5, report: { ...result.report!, groups: [{ taskId: draft.tasks[0].id, gaps: [], candidates: [...models, ...models.slice(0, 5).map((model, index) => ({ ...model, model: `additional-${index}`, reason: "新增推荐理由" }))] }] } } } } };
+      }
+      return Promise.resolve(current);
+    });
+    mount();
+    await user.click(await screen.findByRole("button", { name: "再来 5 条" }));
+    expect(await screen.findByRole("heading", { name: "入围模型（15 个）" })).toBeVisible();
+    expect(screen.getAllByRole("article").filter((row) => row.classList.contains("research-candidate"))).toHaveLength(15);
+    expect(screen.getByRole("button", { name: "已补充 5 条" })).toBeDisabled();
+    expect(invoke.mock.calls.filter(([command]) => command === "research_command")).toHaveLength(1);
+    cleanup(); mount();
+    expect(await screen.findByRole("button", { name: "已补充 5 条" })).toBeDisabled();
+  });
+
+  it("allows multiple models in every star tier, always renders three slots and explains role ratings", () => {
+    const draft = card();
+    const models = [3, 3, 2, 2, 1, 1].map((stars, index) => ({ model: `rating-${index}`, role: "candidate", mainStars: stars, fallbackStars: stars, reason: "当前任务适配理由", mainReason: "主力成本与时延符合当前输入规模", fallbackReason: "复杂结果的校验质量适合兜底", evidence: [], test: "", gaps: [] }));
+    render(<SelectionResearch card={draft} result={{ status: "complete", revision: 1, sources: [], error: "", report: { findings: [], questions: [], groups: [{ taskId: draft.tasks[0].id, candidates: models, gaps: [] }] } }} busy={false} onRetry={vi.fn()} />);
+    for (const role of ["主力模型", "兜底模型"]) {
+      for (const stars of [1, 2, 3]) {
+        const cells = screen.getAllByRole("img", { name: `${role}推荐程度：${stars} 星` });
+        expect(cells).toHaveLength(2);
+        for (const cell of cells) {
+          const paths = Array.from(cell.querySelectorAll("path"));
+          expect(paths).toHaveLength(3);
+          expect(paths.filter((path) => path.getAttribute("fill") === "#000")).toHaveLength(stars);
+        }
+      }
+    }
+    expect(screen.getAllByText("主力成本与时延符合当前输入规模")).toHaveLength(6);
+    expect(screen.getAllByText("复杂结果的校验质量适合兜底")).toHaveLength(6);
+  });
+
+  it.each([false, true])("regrades a saved legacy list once, including an interrupted attempt (%s), without changing models or extra-model quota", async (attempted) => {
+    const draft = card();
+    const models = ["a", "b", "c", "d"].map((model, index) => ({ model, role: "candidate", mainRank: index === 0 ? 1 : index === 1 ? 2 : 0, fallbackRank: index === 2 ? 1 : index === 3 ? 2 : 0, mainStars: 0, fallbackStars: 0, reason: "原有需求适配理由", evidence: [], test: "", gaps: [] }));
+    const result = { status: "complete" as const, revision: 1, sources: [], error: "", needsRatings: true, ratingAttempted: attempted, moreRequested: true, moreAddedCount: 5, report: { findings: [], questions: [], groups: [{ taskId: draft.tasks[0].id, candidates: models, gaps: [] }] } };
+    let current: SelectionSession = { ...initial(), revision: 1, draft, confirmed: { card: draft, revision: 1, confirmedAtMs: 1 }, taskRuns: { [draft.tasks[0].id]: { selectedModel: "a", research: result } } };
+    invoke.mockImplementation((command: string) => {
+      if (command === "selection_rate") current = { ...current, taskRuns: { [draft.tasks[0].id]: { selectedModel: "a", research: { ...result, needsRatings: false, ratingAttempted: true, report: { ...result.report, groups: [{ ...result.report.groups[0], candidates: models.map((model, index) => ({ ...model, mainStars: index < 2 ? 3 : 2, fallbackStars: index < 2 ? 2 : 3, mainReason: "符合需求卡低成本结构化输出", fallbackReason: "需求卡歧义场景仍需专项校验" })) }] } } } } };
+      return Promise.resolve(current);
+    });
+    mount();
+    await waitFor(() => expect(screen.getAllByRole("img", { name: "主力模型推荐程度：3 星" })).toHaveLength(2));
+    expect(screen.getAllByRole("img", { name: "兜底模型推荐程度：3 星" })).toHaveLength(2);
+    expect(screen.getByRole("heading", { name: "入围模型（4 个）" })).toBeVisible();
+    expect(screen.getByRole("button", { name: "已补充 5 条" })).toBeDisabled();
+    expect(invoke.mock.calls.filter(([command]) => command === "selection_rate")).toHaveLength(1);
+    expect(invoke.mock.calls.filter(([command]) => command === "research_command")).toHaveLength(0);
+  });
+
   it("keeps the current card if a new conversation cannot be saved", async () => {
     const user = userEvent.setup();
     const draft = card();
@@ -984,7 +1127,7 @@ describe("model selection", () => {
     const current: SelectionSession = { ...initial(), revision: 1, draft, confirmed: { card: draft, revision: 1, confirmedAtMs: 1 }, taskRuns: { [draft.tasks[0].id]: { selectedModel: null, research: { status: "failed", revision: 1, sources: [], report: null, error: "本次调研失败" } } } };
     invoke.mockResolvedValue(current); mount();
     expect(await screen.findByText("本次调研失败")).toBeVisible();
-    await user.click(screen.getByRole("button", { name: "重新调研" }));
+    await user.click(screen.getByRole("button", { name: "重试生成" }));
     expect(invoke.mock.calls.filter(([command]) => command === "research_command").map(([, args]) => args)).toEqual([{ sessionId: current.id, revision: 1, taskId: draft.tasks[0].id, retry: true, asOfDate: expect.stringMatching(/^\d{4}-\d{2}-\d{2}$/) }]);
     expect(screen.queryByRole("tablist")).not.toBeInTheDocument();
   });

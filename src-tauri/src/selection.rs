@@ -104,7 +104,41 @@ pub(crate) struct Invocation {
     model_id: String,
     connection_name: String,
     elapsed_ms: u64,
+    first_token_ms: Option<u64>,
     usage: Option<Usage>,
+}
+
+#[derive(Clone, Default, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase", default)]
+struct SelectionMetrics {
+    completed_calls: u64,
+    usage_calls: u64,
+    total_tokens: u64,
+    cache_hit_tokens: u64,
+    cache_input_tokens: u64,
+    latest: Option<Invocation>,
+}
+
+impl SelectionMetrics {
+    fn record(&mut self, invocation: Invocation) {
+        self.completed_calls += 1;
+        if let Some(usage) = &invocation.usage {
+            if let Some(total) = usage
+                .total_tokens
+                .or_else(|| Some(usage.input_tokens? + usage.output_tokens?))
+            {
+                self.usage_calls += 1;
+                self.total_tokens += total;
+            }
+            if let (Some(input), Some(cached)) = (usage.input_tokens, usage.cached_input_tokens)
+                && cached <= input
+            {
+                self.cache_input_tokens += input;
+                self.cache_hit_tokens += cached;
+            }
+        }
+        self.latest = Some(invocation);
+    }
 }
 
 #[derive(Clone, Deserialize, Serialize)]
@@ -169,6 +203,8 @@ pub(crate) struct SelectionSession {
     draft: Option<RequirementCard>,
     confirmed: Option<ConfirmedCard>,
     invocation: Option<Invocation>,
+    #[serde(default)]
+    metrics: SelectionMetrics,
     progress: Option<ExtractionProgress>,
     task_runs: BTreeMap<String, TaskRun>,
     #[serde(default)]
@@ -205,6 +241,7 @@ impl Default for SelectionSession {
             draft: None,
             confirmed: None,
             invocation: None,
+            metrics: SelectionMetrics::default(),
             progress: None,
             task_runs: BTreeMap::new(),
             storage_error: String::new(),
@@ -865,6 +902,7 @@ async fn extract_request(
     description: &str,
     progress: impl Fn(&str),
     stream_progress: impl Fn(&str, &str),
+    record_invocation: impl Fn(Invocation),
 ) -> AppResult<(RequirementCard, Invocation)> {
     let started = Instant::now();
     let mut prompt = include_str!("prompts/selection_extract.txt").to_string();
@@ -879,6 +917,7 @@ async fn extract_request(
             "需求确认卡",
             &progress,
             &stream_progress,
+            &record_invocation,
         )
         .await?;
         let checked = parse_card(&output.text, description).and_then(|card| {
@@ -916,6 +955,7 @@ async fn assistant_request(
     output_name: &str,
     progress: impl Fn(&str),
     stream_progress: impl Fn(&str, &str),
+    record_invocation: impl Fn(Invocation),
 ) -> AppResult<(GeneratedText, Invocation)> {
     let is_card = output_name == "需求确认卡";
     let request_failure = |error: reqwest::Error| {
@@ -1052,15 +1092,15 @@ async fn assistant_request(
         parse_openai_response(response)?
     };
     let usage = output.usage.clone();
-    Ok((
-        output,
-        Invocation {
-            model_id: model_id.to_string(),
-            connection_name: connection.display_name.clone(),
-            elapsed_ms: started.elapsed().as_millis() as u64,
-            usage,
-        },
-    ))
+    let invocation = Invocation {
+        model_id: model_id.to_string(),
+        connection_name: connection.display_name.clone(),
+        elapsed_ms: started.elapsed().as_millis() as u64,
+        first_token_ms: output.first_token_ms,
+        usage,
+    };
+    record_invocation(invocation.clone());
+    Ok((output, invocation))
 }
 
 fn card_progress_message(content: &str) -> String {
@@ -1191,6 +1231,16 @@ pub(crate) async fn selection_extract(
                     && let Some(progress) = &mut session.progress
                 {
                     update_stream_progress(progress, content, reasoning);
+                }
+            },
+            |invocation| {
+                if let Ok(mut session) = state.0.lock()
+                    && session.id == input.session_id
+                    && session.running
+                    && session.attempt.as_ref().map(|attempt| &attempt.request_id)
+                        == Some(&input.request_id)
+                {
+                    session.metrics.record(invocation);
                 }
             },
         ),
@@ -1387,6 +1437,7 @@ pub(crate) async fn research_command(
     task_id: String,
     retry: bool,
     as_of_date: String,
+    more: Option<bool>,
     app_state: State<'_, AppState>,
     state: State<'_, SelectionState>,
 ) -> AppResult<SelectionSession> {
@@ -1404,14 +1455,25 @@ pub(crate) async fn research_command(
     let settings = AssistantSettings::default();
     let connection = official_connection();
     let key = driver_key(&app_state.config_path)?;
-    let card = {
+    let adding = more.unwrap_or(false);
+    let (card, excluded_models) = {
         let mut session = state.0.lock().map_err(|_| lock_error())?;
         version_check(&session, &session_id, revision)?;
+        if adding
+            && session
+                .task_runs
+                .get(&task_id)
+                .and_then(|run| run.research.as_ref())
+                .is_some_and(|result| result.more_requested)
+        {
+            return Ok(session.clone());
+        }
         if session.running {
             return Err(validation("当前任务正在执行，请勿重复提交。"));
         }
         let card = task_card(&session, &task_id)?;
-        if !retry
+        if !adding
+            && !retry
             && session
                 .task_runs
                 .get(&task_id)
@@ -1424,25 +1486,48 @@ pub(crate) async fn research_command(
         {
             return Ok(session.clone());
         }
+        let excluded_models = if adding {
+            request_more_candidates(&mut session, &task_id)?
+        } else {
+            Vec::new()
+        };
         session.running = true;
         session.progress = Some(ExtractionProgress {
-            message: "正在核对当前官方模型目录…".into(),
+            message: if adding {
+                "正在查找另外 5 个适合的模型…"
+            } else {
+                "正在核对当前官方模型目录…"
+            }
+            .into(),
             started_at_ms: now_ms(),
             ..Default::default()
         });
-        let run = session.task_runs.entry(task_id.clone()).or_default();
-        let previous = run.research.take();
-        run.research = Some(research::ResearchResult {
-            status: "running".into(),
-            revision,
-            researched_at_ms: now_ms(),
-            as_of_date: as_of_date.clone(),
-            sources: previous.map(|result| result.sources).unwrap_or_default(),
-            report: None,
-            error: String::new(),
-        });
+        if !adding {
+            let run = session.task_runs.entry(task_id.clone()).or_default();
+            let previous = run.research.take();
+            run.research = Some(research::ResearchResult {
+                status: "running".into(),
+                revision,
+                researched_at_ms: now_ms(),
+                as_of_date: as_of_date.clone(),
+                sources: previous.map(|result| result.sources).unwrap_or_default(),
+                report: None,
+                error: String::new(),
+                more_requested: false,
+                more_added_count: 0,
+                more_error: String::new(),
+                needs_ratings: false,
+                rating_attempted: false,
+                rating_error: String::new(),
+                rating_version: 1,
+            });
+        }
         state.checkpoint(&mut session, false);
-        card
+        if adding && !session.storage_error.is_empty() {
+            session.running = false;
+            return Err(validation(&session.storage_error));
+        }
+        (card, excluded_models)
     };
     let update_progress = |message: &str| {
         if let Ok(mut session) = state.0.lock()
@@ -1455,7 +1540,8 @@ pub(crate) async fn research_command(
         }
     };
     let save_sources = |sources| {
-        if let Ok(mut session) = state.0.lock()
+        if !adding
+            && let Ok(mut session) = state.0.lock()
             && session.id == session_id
             && session.revision == revision
             && session.running
@@ -1483,9 +1569,19 @@ pub(crate) async fn research_command(
         &settings,
         &connection,
         key,
+        &excluded_models,
         update_progress,
         save_sources,
         stream_progress,
+        |invocation| {
+            if let Ok(mut session) = state.0.lock()
+                && session.id == session_id
+                && session.revision == revision
+                && session.running
+            {
+                session.metrics.record(invocation);
+            }
+        },
     )
     .await;
     let mut session = state.0.lock().map_err(|_| lock_error())?;
@@ -1495,12 +1591,27 @@ pub(crate) async fn research_command(
         && let Some(research) = &mut run.research
     {
         match result {
+            Ok((report, sources)) if adding => {
+                if let Some(existing) = &mut research.report {
+                    research.more_added_count = existing.append_candidates(report);
+                    research.sources.extend(sources);
+                    research.needs_ratings = existing.needs_ratings();
+                    research.rating_attempted = false;
+                    if research.more_added_count == 0 {
+                        research.more_error = "本次未找到其他不同型号，原有推荐已保留。".into();
+                    }
+                }
+            }
             Ok((mut report, sources)) => {
                 report.assign_recommendations();
                 (run.selected_model, run.fallback_model) = report.recommended_pair(&task_id);
                 research.status = research::status(&report, &sources);
+                research.needs_ratings = report.needs_ratings();
                 research.report = Some(report);
                 research.sources = sources;
+            }
+            Err(error) if adding => {
+                research.more_error = error.message;
             }
             Err(error) => {
                 research.status = "failed".into();
@@ -1510,6 +1621,156 @@ pub(crate) async fn research_command(
     }
     state.checkpoint(&mut session, false);
     Ok(session.clone())
+}
+
+#[tauri::command]
+pub(crate) async fn selection_rate(
+    session_id: String,
+    revision: u64,
+    task_id: String,
+    retry: bool,
+    app_state: State<'_, AppState>,
+    state: State<'_, SelectionState>,
+) -> AppResult<SelectionSession> {
+    let settings = AssistantSettings::default();
+    let connection = official_connection();
+    let key = driver_key(&app_state.config_path)?;
+    let material = {
+        let mut session = state.0.lock().map_err(|_| lock_error())?;
+        version_check(&session, &session_id, revision)?;
+        let card = task_card(&session, &task_id)?;
+        let result = session
+            .task_runs
+            .get(&task_id)
+            .and_then(|run| run.research.as_ref())
+            .ok_or_else(|| validation("请先生成推荐名单。"))?;
+        if !result.needs_ratings || (result.rating_attempted && !retry) {
+            return Ok(session.clone());
+        }
+        let models = result
+            .report
+            .as_ref()
+            .ok_or_else(|| validation("请先生成推荐名单。"))?
+            .rating_material();
+        let material =
+            serde_json::json!({"requirements":card,"groups":models,"sources":result.sources})
+                .to_string();
+        if session.running {
+            return Err(validation("请等待当前请求完成。"));
+        }
+        let result = session
+            .task_runs
+            .get_mut(&task_id)
+            .unwrap()
+            .research
+            .as_mut()
+            .unwrap();
+        result.rating_attempted = true;
+        result.rating_version = 1;
+        result.rating_error.clear();
+        session.running = true;
+        session.progress = Some(ExtractionProgress {
+            message: "正在按需求卡重新评定推荐星级…".into(),
+            started_at_ms: now_ms(),
+            ..Default::default()
+        });
+        state.checkpoint(&mut session, false);
+        if !session.storage_error.is_empty() {
+            session.running = false;
+            return Err(validation(&session.storage_error));
+        }
+        material
+    };
+    let prompt = include_str!("prompts/selection_rating.txt");
+    let generated = assistant_request(
+        &settings,
+        &connection,
+        key,
+        &material,
+        prompt,
+        "推荐星级",
+        |message| {
+            if let Ok(mut session) = state.0.lock()
+                && session.id == session_id
+                && session.revision == revision
+                && let Some(progress) = &mut session.progress
+            {
+                progress.message = message.into();
+            }
+        },
+        |content, reasoning| {
+            if let Ok(mut session) = state.0.lock()
+                && session.id == session_id
+                && session.revision == revision
+                && let Some(progress) = &mut session.progress
+            {
+                update_stream_progress(progress, content, reasoning);
+            }
+        },
+        |invocation| {
+            if let Ok(mut session) = state.0.lock()
+                && session.id == session_id
+                && session.revision == revision
+            {
+                session.metrics.record(invocation);
+            }
+        },
+    )
+    .await;
+    let mut session = state.0.lock().map_err(|_| lock_error())?;
+    version_check(&session, &session_id, revision)?;
+    session.running = false;
+    if let Some(result) = session
+        .task_runs
+        .get_mut(&task_id)
+        .and_then(|run| run.research.as_mut())
+    {
+        let graded = generated.and_then(|(output, _)| {
+            result
+                .report
+                .as_mut()
+                .ok_or_else(|| validation("原推荐名单不存在。"))?
+                .apply_ratings(&output.text)
+        });
+        match graded {
+            Ok(()) => {
+                result.needs_ratings = false;
+                result.rating_error.clear();
+            }
+            Err(error) => {
+                result.rating_error = error.message;
+            }
+        }
+    }
+    state.checkpoint(&mut session, false);
+    Ok(session.clone())
+}
+
+fn request_more_candidates(
+    session: &mut SelectionSession,
+    task_id: &str,
+) -> AppResult<Vec<String>> {
+    let result = session
+        .task_runs
+        .get_mut(task_id)
+        .and_then(|run| run.research.as_mut())
+        .ok_or_else(|| validation("请先生成推荐名单。"))?;
+    if result.more_requested {
+        return Err(validation("本轮推荐只能补充一次。"));
+    }
+    if result.revision != session.revision
+        || !["complete", "partial"].contains(&result.status.as_str())
+    {
+        return Err(validation("请先完成本轮推荐。"));
+    }
+    let models = result
+        .report
+        .as_ref()
+        .map(|report| report.model_names())
+        .filter(|models| !models.is_empty())
+        .ok_or_else(|| validation("请先生成推荐名单。"))?;
+    result.more_requested = true;
+    Ok(models)
 }
 
 #[cfg(test)]
@@ -1938,6 +2199,13 @@ mod tests {
                     sources: vec![],
                     report: Some(report),
                     error: String::new(),
+                    more_requested: false,
+                    more_added_count: 0,
+                    more_error: String::new(),
+                    needs_ratings: false,
+                    rating_attempted: false,
+                    rating_error: String::new(),
+                    rating_version: 1,
                 }),
             },
         );
@@ -2277,6 +2545,7 @@ mod tests {
             model_id: DEFAULT_MODEL.into(),
             connection_name: "test".into(),
             elapsed_ms: 1,
+            first_token_ms: None,
             usage: None,
         };
         finish_extraction(&mut session, Ok((previous.clone(), invocation))).unwrap();
@@ -2456,6 +2725,7 @@ mod tests {
             "调研结论",
             |_| {},
             |_, _| {},
+            |_| {},
         )
         .await
         .unwrap();
@@ -2477,8 +2747,9 @@ mod tests {
 
     #[tokio::test]
     async fn uses_the_real_http_contract_and_validates_before_returning_a_card() {
-        let body = serde_json::json!({"choices":[{"message":{"content":serde_json::to_string(&prefilled_card()).unwrap()}}],"usage":{"prompt_tokens":20,"completion_tokens":30,"total_tokens":50}});
+        let body = serde_json::json!({"choices":[{"message":{"content":serde_json::to_string(&prefilled_card()).unwrap()}}],"usage":{"prompt_tokens":20,"completion_tokens":30,"total_tokens":50,"prompt_cache_hit_tokens":16}});
         let (connection, thread) = mock_connection("200 OK", body);
+        let metrics = Mutex::new(SelectionMetrics::default());
         let (draft, invocation) = extract_request(
             &AssistantSettings::default(),
             &connection,
@@ -2486,12 +2757,18 @@ mod tests {
             "会议录音转文字，预算未定",
             |_| {},
             |_, _| {},
+            |invocation| metrics.lock().unwrap().record(invocation),
         )
         .await
         .unwrap();
         thread.join().unwrap();
         assert_eq!(draft.tasks[0].fields["cost"].value, "");
         assert_eq!(invocation.usage.unwrap().total_tokens, Some(50));
+        let metrics = metrics.lock().unwrap();
+        assert_eq!(metrics.completed_calls, 1);
+        assert_eq!(metrics.total_tokens, 50);
+        assert_eq!(metrics.cache_hit_tokens, 16);
+        assert_eq!(metrics.cache_input_tokens, 20);
         let (connection, thread) = mock_connection(
             "401 Unauthorized",
             serde_json::json!({"error":{"message":"Invalid key: sk-test-secret"}}),
@@ -2503,6 +2780,7 @@ mod tests {
             "会议录音转文字",
             |_| {},
             |_, _| {},
+            |_| {},
         )
         .await
         .err()
@@ -2510,6 +2788,79 @@ mod tests {
         thread.join().unwrap();
         assert_eq!(error.code, "AUTH_FAILED");
         assert!(!error.message.contains("sk-test-secret"));
+    }
+
+    #[test]
+    fn more_candidates_are_consumed_once_and_remain_consumed_after_reload() {
+        let mut session = SelectionSession::default();
+        let report = research::parse_report(
+            r#"{"candidates":[{"model":"existing","reason":"适合当前任务。"}]}"#,
+            &card(),
+        )
+        .unwrap();
+        let result: research::ResearchResult = serde_json::from_value(serde_json::json!({"status":"complete","revision":0,"researchedAtMs":1,"asOfDate":"2026-10-22","sources":[],"report":report,"error":""})).unwrap();
+        session.task_runs.insert(
+            "task".into(),
+            TaskRun {
+                research: Some(result),
+                ..Default::default()
+            },
+        );
+        assert_eq!(
+            request_more_candidates(&mut session, "task").unwrap(),
+            vec!["existing"]
+        );
+        assert!(request_more_candidates(&mut session, "task").is_err());
+        let mut restored: SelectionSession =
+            serde_json::from_value(serde_json::to_value(&session).unwrap()).unwrap();
+        assert!(request_more_candidates(&mut restored, "task").is_err());
+        assert!(
+            restored.task_runs["task"]
+                .research
+                .as_ref()
+                .unwrap()
+                .report
+                .as_ref()
+                .unwrap()
+                .has_candidate("task", "existing")
+        );
+    }
+
+    #[test]
+    fn preserves_cumulative_metrics_and_excludes_missing_or_invalid_cache_usage() {
+        let mut metrics = SelectionMetrics::default();
+        let invocation = |usage| Invocation {
+            model_id: DEFAULT_MODEL.into(),
+            connection_name: "test".into(),
+            elapsed_ms: 3000,
+            first_token_ms: Some(1000),
+            usage,
+        };
+        for value in [
+            serde_json::json!({"prompt_tokens":100,"completion_tokens":20,"total_tokens":120,"prompt_cache_hit_tokens":96}),
+            serde_json::json!({"prompt_tokens":200,"completion_tokens":20,"prompt_cache_hit_tokens":0}),
+            serde_json::json!({"prompt_tokens":10,"completion_tokens":20,"total_tokens":30,"prompt_cache_hit_tokens":20}),
+        ] {
+            metrics.record(invocation(usage_from_value(&value)));
+        }
+        metrics.record(invocation(None));
+        let restored: SelectionMetrics =
+            serde_json::from_value(serde_json::to_value(&metrics).unwrap()).unwrap();
+        assert_eq!(restored.completed_calls, 4);
+        assert_eq!(restored.usage_calls, 3);
+        assert_eq!(restored.total_tokens, 370);
+        assert_eq!(restored.cache_hit_tokens, 96);
+        assert_eq!(restored.cache_input_tokens, 300);
+        assert!(restored.latest.unwrap().usage.is_none());
+        let mut old = serde_json::to_value(SelectionSession::default()).unwrap();
+        old.as_object_mut().unwrap().remove("metrics");
+        assert_eq!(
+            serde_json::from_value::<SelectionSession>(old)
+                .unwrap()
+                .metrics
+                .completed_calls,
+            0
+        );
     }
 
     #[tokio::test]
@@ -2530,6 +2881,7 @@ mod tests {
             |content, reasoning| {
                 update_stream_progress(&mut updates.lock().unwrap(), content, reasoning)
             },
+            |_| {},
         )
         .await
         .unwrap();
@@ -2570,6 +2922,7 @@ mod tests {
             "调研结论",
             |message| messages.lock().unwrap().push(message.to_string()),
             |_, _| {},
+            |_| {},
         )
         .await
         .unwrap();
@@ -2609,6 +2962,7 @@ mod tests {
             "会议录音转文字，预算未定",
             |_| {},
             |_, _| {},
+            |_| {},
         )
         .await
         .unwrap();
@@ -2631,6 +2985,7 @@ mod tests {
             "本次只为会议录音转成文字这一个 AI 环节选模型，现在人工转写，预算未定。",
             |_| {},
             |_, _| {},
+            |_| {},
         )
         .await
         .expect("真实需求整理失败");

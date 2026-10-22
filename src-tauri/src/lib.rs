@@ -198,6 +198,8 @@ struct Usage {
     /// 推理模型「思考」消耗的 token，包含在 output_tokens 里。
     #[serde(skip_serializing_if = "Option::is_none")]
     reasoning_tokens: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    cached_input_tokens: Option<u64>,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -1122,6 +1124,7 @@ struct OpenAiMessage {
 #[derive(Deserialize)]
 struct OpenAiUsageDetails {
     reasoning_tokens: Option<u64>,
+    cached_tokens: Option<u64>,
 }
 #[derive(Deserialize)]
 struct OpenAiUsage {
@@ -1129,6 +1132,8 @@ struct OpenAiUsage {
     completion_tokens: Option<u64>,
     total_tokens: Option<u64>,
     completion_tokens_details: Option<OpenAiUsageDetails>,
+    prompt_cache_hit_tokens: Option<u64>,
+    prompt_tokens_details: Option<OpenAiUsageDetails>,
 }
 #[derive(Deserialize)]
 struct CatalogResponse {
@@ -1638,6 +1643,7 @@ fn parse_image_response(body: serde_json::Value) -> AppResult<GeneratedImage> {
                 output_tokens,
                 total_tokens,
                 reasoning_tokens: None,
+                cached_input_tokens: None,
             },
         )
     });
@@ -2170,6 +2176,11 @@ fn openai_usage(usage: OpenAiUsage) -> Usage {
         reasoning_tokens: usage
             .completion_tokens_details
             .and_then(|details| details.reasoning_tokens),
+        cached_input_tokens: usage.prompt_cache_hit_tokens.or_else(|| {
+            usage
+                .prompt_tokens_details
+                .and_then(|details| details.cached_tokens)
+        }),
     }
 }
 
@@ -3429,6 +3440,8 @@ pub fn run() {
             selection::conversations::selection_conversations,
             selection::conversations::selection_conversation_open,
             selection::conversations::selection_conversation_save,
+            selection::conversations::selection_conversation_pin,
+            selection::conversations::selection_conversation_delete,
             selection::selection_open_api,
             selection::selection_reset,
             selection::selection_assistant_set,
@@ -3436,6 +3449,7 @@ pub fn run() {
             selection::selection_select_task,
             selection::selection_confirm,
             selection::research_command,
+            selection::selection_rate,
             selection::selection_choose,
             settings_get,
             provider_models,
@@ -3473,6 +3487,8 @@ mod tests {
                 completion_tokens: Some(2),
                 total_tokens: Some(6),
                 completion_tokens_details: None,
+                prompt_cache_hit_tokens: None,
+                prompt_tokens_details: None,
             }),
         })
         .expect("response should parse");
@@ -3496,7 +3512,10 @@ mod tests {
                 total_tokens: Some(665),
                 completion_tokens_details: Some(OpenAiUsageDetails {
                     reasoning_tokens: Some(496),
+                    cached_tokens: None,
                 }),
+                prompt_cache_hit_tokens: None,
+                prompt_tokens_details: None,
             }),
         })
         .expect("response should parse");
@@ -3504,6 +3523,30 @@ mod tests {
         let usage = result.usage.expect("usage");
         assert_eq!(usage.reasoning_tokens, Some(496));
         assert_eq!(usage.output_tokens, Some(657));
+    }
+
+    #[test]
+    fn parses_cached_input_tokens_in_both_official_response_shapes() {
+        for value in [
+            serde_json::json!({"prompt_tokens":100,"completion_tokens":20,"total_tokens":120,"prompt_cache_hit_tokens":96}),
+            serde_json::json!({"prompt_tokens":100,"completion_tokens":20,"total_tokens":120,"prompt_tokens_details":{"cached_tokens":96}}),
+        ] {
+            let usage = usage_from_value(&value).unwrap();
+            assert_eq!(usage.cached_input_tokens, Some(96));
+            assert_eq!(usage.input_tokens, Some(100));
+        }
+        assert_eq!(
+            usage_from_value(&serde_json::json!({"prompt_tokens":10,"prompt_cache_hit_tokens":0}))
+                .unwrap()
+                .cached_input_tokens,
+            Some(0)
+        );
+        assert_eq!(
+            usage_from_value(&serde_json::json!({"prompt_tokens":10}))
+                .unwrap()
+                .cached_input_tokens,
+            None
+        );
     }
 
     #[test]

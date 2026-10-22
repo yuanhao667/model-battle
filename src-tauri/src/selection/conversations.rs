@@ -1,4 +1,5 @@
 use super::*;
+use std::collections::BTreeSet;
 
 #[derive(Clone, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
@@ -14,12 +15,18 @@ struct SavedConversation {
     session: SelectionSession,
     view: Option<ConversationView>,
     updated_at_ms: u64,
+    #[serde(default)]
+    pinned: bool,
+    #[serde(default)]
+    pin_updated_at_ms: u64,
 }
 
 #[derive(Clone, Default, Deserialize, Serialize)]
 pub(super) struct History {
     active_id: String,
     sessions: BTreeMap<String, SavedConversation>,
+    #[serde(default)]
+    deleted_ids: BTreeSet<String>,
     #[serde(skip)]
     path: Option<PathBuf>,
     #[serde(skip)]
@@ -32,6 +39,7 @@ pub(crate) struct ConversationSummary {
     id: String,
     title: String,
     updated_at_ms: u64,
+    pinned: bool,
 }
 
 #[derive(Serialize)]
@@ -50,12 +58,19 @@ pub(crate) struct ConversationIndex {
 
 impl History {
     fn record(&mut self, session: &SelectionSession, view: Option<ConversationView>) {
+        let (pinned, pin_updated_at_ms) = self
+            .sessions
+            .get(&session.id)
+            .map(|saved| (saved.pinned, saved.pin_updated_at_ms))
+            .unwrap_or_default();
         self.sessions.insert(
             session.id.clone(),
             SavedConversation {
                 session: session.clone(),
                 view,
                 updated_at_ms: now_ms(),
+                pinned,
+                pin_updated_at_ms,
             },
         );
         self.active_id = session.id.clone();
@@ -104,13 +119,16 @@ impl History {
                             .collect()
                     },
                     updated_at_ms: saved.updated_at_ms,
+                    pinned: saved.pinned,
                 }
             })
             .collect();
         items.sort_by(|a, b| {
-            b.updated_at_ms
-                .cmp(&a.updated_at_ms)
-                .then_with(|| a.id.cmp(&b.id))
+            b.pinned.cmp(&a.pinned).then_with(|| {
+                b.updated_at_ms
+                    .cmp(&a.updated_at_ms)
+                    .then_with(|| a.id.cmp(&b.id))
+            })
         });
         items
     }
@@ -147,18 +165,32 @@ impl History {
             Ok(bytes) => {
                 let disk: History = serde_json::from_slice(&bytes)
                     .map_err(|_| validation("选型对话文件无法读取，原文件已保留。"))?;
+                self.deleted_ids.extend(disk.deleted_ids);
                 for (id, saved) in disk.sessions {
-                    if self
-                        .sessions
-                        .get(&id)
-                        .is_none_or(|local| saved.updated_at_ms > local.updated_at_ms)
-                    {
+                    if let Some(local) = self.sessions.get_mut(&id) {
+                        let pin = if saved.pin_updated_at_ms > local.pin_updated_at_ms {
+                            (saved.pinned, saved.pin_updated_at_ms)
+                        } else {
+                            (local.pinned, local.pin_updated_at_ms)
+                        };
+                        if saved.updated_at_ms > local.updated_at_ms {
+                            *local = saved;
+                        }
+                        (local.pinned, local.pin_updated_at_ms) = pin;
+                    } else {
                         self.sessions.insert(id, saved);
                     }
                 }
             }
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
             Err(_) => return Err(validation("无法读取本机选型对话，原文件已保留。")),
+        }
+        // 删除标记只保存 ID，避免旧窗口的自动保存把已删对话重新写回来。
+        self.sessions.retain(|id, _| !self.deleted_ids.contains(id));
+        if self.deleted_ids.contains(&self.active_id) {
+            return Err(validation(
+                "当前选型对话已在另一窗口删除，请切换或新建选型。",
+            ));
         }
         let bytes = serde_json::to_vec(self).map_err(|_| validation("无法保存选型对话。"))?;
         let temp = path.with_file_name(format!("selection-history-{}.tmp", Uuid::new_v4()));
@@ -204,6 +236,11 @@ impl SelectionState {
             session.running = false;
             session.progress = None;
             session.storage_error.clear();
+            if session.metrics.completed_calls == 0
+                && let Some(invocation) = session.invocation.clone()
+            {
+                session.metrics.record(invocation);
+            }
             for card in session
                 .draft
                 .iter_mut()
@@ -218,6 +255,23 @@ impl SelectionState {
                 migrate_legacy_io(card);
             }
             for run in session.task_runs.values_mut() {
+                if let Some(report) = run
+                    .research
+                    .as_mut()
+                    .and_then(|result| result.report.as_mut())
+                {
+                    report.discard_legacy_ratings();
+                    report.assign_recommendations();
+                }
+                if let Some(result) = &mut run.research {
+                    result.needs_ratings = result
+                        .report
+                        .as_ref()
+                        .is_some_and(|report| report.needs_ratings());
+                    if result.needs_ratings && result.rating_version < 1 {
+                        result.rating_attempted = false;
+                    }
+                }
                 if let Some(result) = &mut run.research
                     && result.status == "running"
                 {
@@ -296,6 +350,83 @@ fn switch_conversation(
     *current = target;
     *history = next;
     Ok(workspace)
+}
+
+fn manage_conversation(
+    current: &mut SelectionSession,
+    history: &mut History,
+    view: ConversationView,
+    target_id: &str,
+    pinned: Option<bool>,
+) -> AppResult<Workspace> {
+    if current.running {
+        return Err(validation("当前正在生成，请完成后再操作选型对话。"));
+    }
+    validate_view(&view)?;
+    let mut next = history.clone();
+    next.record(current, Some(view));
+    let target = next
+        .sessions
+        .get_mut(target_id)
+        .ok_or_else(|| validation("该选型对话不存在。"))?;
+    let (session, view) = if let Some(pinned) = pinned {
+        target.pinned = pinned;
+        target.pin_updated_at_ms = now_ms().max(target.pin_updated_at_ms.saturating_add(1));
+        (current.clone(), next.sessions[&current.id].view.clone())
+    } else {
+        next.sessions.remove(target_id);
+        next.deleted_ids.insert(target_id.into());
+        if target_id == current.id {
+            let saved = next
+                .summaries()
+                .first()
+                .and_then(|item| next.sessions.get(&item.id));
+            saved
+                .map(|saved| (saved.session.clone(), saved.view.clone()))
+                .unwrap_or_else(|| (SelectionSession::default(), None))
+        } else {
+            (current.clone(), next.sessions[&current.id].view.clone())
+        }
+    };
+    next.record(&session, view.clone());
+    next.persist()?;
+    let workspace = Workspace {
+        session: session.clone(),
+        view,
+        conversations: next.summaries(),
+    };
+    *current = session;
+    *history = next;
+    Ok(workspace)
+}
+
+#[tauri::command]
+pub(crate) fn selection_conversation_pin(
+    session_id: String,
+    revision: u64,
+    target_id: String,
+    pinned: bool,
+    view: ConversationView,
+    state: State<'_, SelectionState>,
+) -> AppResult<Workspace> {
+    let mut current = state.0.lock().map_err(|_| lock_error())?;
+    version_check(&current, &session_id, revision)?;
+    let mut history = state.1.lock().map_err(|_| lock_error())?;
+    manage_conversation(&mut current, &mut history, view, &target_id, Some(pinned))
+}
+
+#[tauri::command]
+pub(crate) fn selection_conversation_delete(
+    session_id: String,
+    revision: u64,
+    target_id: String,
+    view: ConversationView,
+    state: State<'_, SelectionState>,
+) -> AppResult<Workspace> {
+    let mut current = state.0.lock().map_err(|_| lock_error())?;
+    version_check(&current, &session_id, revision)?;
+    let mut history = state.1.lock().map_err(|_| lock_error())?;
+    manage_conversation(&mut current, &mut history, view, &target_id, None)
 }
 
 #[tauri::command]
@@ -573,6 +704,107 @@ mod tests {
                 .len(),
             2
         );
+        fs::remove_dir_all(folder).unwrap();
+    }
+
+    #[test]
+    fn pinning_survives_saves_reload_and_other_windows() {
+        let folder = std::env::temp_dir().join(format!("selection-pin-{}", Uuid::new_v4()));
+        let path = folder.join("history.json");
+        let mut current = SelectionSession::default();
+        let first = current.id.clone();
+        let draft = view(super::super::tests::card());
+        let mut history = History {
+            path: Some(path.clone()),
+            ..Default::default()
+        };
+        switch_conversation(&mut current, &mut history, draft.clone(), None).unwrap();
+        let mut stale = history.clone();
+        let mut stale_current = current.clone();
+        manage_conversation(
+            &mut current,
+            &mut history,
+            draft.clone(),
+            &first,
+            Some(true),
+        )
+        .unwrap();
+        assert!(history.summaries()[0].pinned);
+        assert_eq!(history.summaries()[0].id, first);
+        stale.record(&stale_current, Some(draft.clone()));
+        stale.persist().unwrap();
+        assert!(stale.sessions[&first].pinned);
+        let reloaded = SelectionState::load(path.clone()).unwrap();
+        assert!(reloaded.1.lock().unwrap().sessions[&first].pinned);
+        manage_conversation(&mut stale_current, &mut stale, draft, &first, Some(false)).unwrap();
+        assert!(
+            !SelectionState::load(path)
+                .unwrap()
+                .1
+                .lock()
+                .unwrap()
+                .sessions[&first]
+                .pinned
+        );
+        fs::remove_dir_all(folder).unwrap();
+    }
+
+    #[test]
+    fn deleting_current_restores_another_draft_and_stale_windows_cannot_resurrect_it() {
+        let folder = std::env::temp_dir().join(format!("selection-delete-{}", Uuid::new_v4()));
+        let path = folder.join("history.json");
+        let mut current = SelectionSession::default();
+        let first = current.id.clone();
+        let draft = view(super::super::tests::card());
+        let mut history = History {
+            path: Some(path.clone()),
+            ..Default::default()
+        };
+        switch_conversation(&mut current, &mut history, draft.clone(), None).unwrap();
+        let second = current.id.clone();
+        let mut stale = history.clone();
+        let workspace =
+            manage_conversation(&mut current, &mut history, draft.clone(), &second, None).unwrap();
+        assert_eq!(current.id, first);
+        assert_eq!(workspace.view.unwrap().description, "未发送的补充");
+        stale.active_id = first.clone();
+        stale.persist().unwrap();
+        assert!(!stale.sessions.contains_key(&second));
+        let restored = SelectionState::load(path.clone()).unwrap();
+        assert!(!restored.1.lock().unwrap().sessions.contains_key(&second));
+        let workspace =
+            manage_conversation(&mut current, &mut history, draft, &first, None).unwrap();
+        assert_ne!(workspace.session.id, first);
+        assert!(workspace.view.is_none());
+        assert_eq!(workspace.conversations.len(), 1);
+        assert!(workspace.session.draft.is_none());
+        fs::remove_dir_all(folder).unwrap();
+    }
+
+    #[test]
+    fn failed_management_does_not_discard_the_current_draft() {
+        let mut current = SelectionSession::default();
+        let id = current.id.clone();
+        let draft = view(super::super::tests::card());
+        let mut history = History::default();
+        assert!(
+            manage_conversation(&mut current, &mut history, draft.clone(), "missing", None)
+                .is_err()
+        );
+        assert!(history.sessions.is_empty());
+        current.running = true;
+        assert!(
+            manage_conversation(&mut current, &mut history, draft.clone(), &id, Some(true))
+                .is_err()
+        );
+        current.running = false;
+        let folder =
+            std::env::temp_dir().join(format!("selection-delete-failure-{}", Uuid::new_v4()));
+        fs::create_dir_all(&folder).unwrap();
+        history.path = Some(folder.clone());
+        assert!(manage_conversation(&mut current, &mut history, draft, &id, None).is_err());
+        assert_eq!(current.id, id);
+        assert!(history.deleted_ids.is_empty());
         fs::remove_dir_all(folder).unwrap();
     }
 

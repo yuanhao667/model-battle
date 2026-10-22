@@ -1,6 +1,9 @@
 import { invoke } from "@tauri-apps/api/core";
 
 export const DEFAULT_ASSISTANT_MODEL = "deepseek-flash";
+export const ASSISTANT_MODEL_LABEL = "DeepSeek V4.1 Flash";
+// DeepSeek 官方规格：https://api-docs.deepseek.com/quick_start/pricing（2026-10-22 核对）。
+export const ASSISTANT_CONTEXT_TOKENS = 1_000_000;
 export const selectionContextFields = [
   ["projectContext", "业务背景", "业务领域和要解决的问题"],
   ["usageScenario", "用户及使用场景", "谁在什么情况下使用这个 AI 环节，例如教师在线下备课"],
@@ -63,6 +66,13 @@ export function userScenarioValue(card: RequirementCard): string {
   const scenario = card.usageScenario?.value ?? "";
   return !user || scenario.includes(user) ? scenario : [user, scenario].filter((value) => value.trim()).join("；");
 }
+export type SelectionInvocation = {
+  modelId: string;
+  connectionName: string;
+  elapsedMs: number;
+  firstTokenMs?: number | null;
+  usage?: { inputTokens?: number; outputTokens?: number; totalTokens?: number; reasoningTokens?: number; cachedInputTokens?: number } | null;
+};
 export type SelectionSession = {
   id: string;
   revision: number;
@@ -74,11 +84,12 @@ export type SelectionSession = {
   taskRuns?: Record<string, { research: ResearchResult | null; selectedModel: string | null; fallbackModel?: string | null }>;
   draft: RequirementCard | null;
   confirmed: { card: RequirementCard; revision: number; confirmedAtMs: number } | null;
-  invocation: { modelId: string; connectionName: string; elapsedMs: number; usage?: { totalTokens?: number } } | null;
+  invocation: SelectionInvocation | null;
+  metrics?: { completedCalls: number; usageCalls: number; totalTokens: number; cacheHitTokens: number; cacheInputTokens: number; latest: SelectionInvocation | null };
 };
 
 export type ConversationView = { card: RequirementCard | null; description: string; messages: string[]; editing: boolean };
-export type ConversationSummary = { id: string; title: string; updatedAtMs: number };
+export type ConversationSummary = { id: string; title: string; updatedAtMs: number; pinned?: boolean };
 export type SelectionWorkspace = { session: SelectionSession; view: ConversationView | null; conversations: ConversationSummary[] };
 
 type ResearchEvidence = { sourceId: string; quote: string; kind?: string; label?: string };
@@ -89,10 +100,16 @@ export type ResearchResult = {
   asOfDate?: string;
   sources: Array<{ id: string; area: string; title: string; url: string; status: string; checkedAtMs: number; error: string }>;
   error: string;
+  moreRequested?: boolean;
+  moreAddedCount?: number;
+  moreError?: string;
+  needsRatings?: boolean;
+  ratingAttempted?: boolean;
+  ratingError?: string;
   report: {
     notice?: string;
     findings: Array<{ area: string; summary: string; evidence: ResearchEvidence[] }>;
-    groups: Array<{ taskId: string; priorityReason?: string; leaderboard?: ResearchEvidence | null; suitableModels?: Array<{ model: string; displayName?: string; origin?: "china" | "overseas"; reason: string; apiUrl?: string; keywords?: string[]; evidence: ResearchEvidence[] }>; candidates: Array<{ model: string; displayName?: string; origin?: "china" | "overseas"; role: string; mainRank?: number; fallbackRank?: number; basis?: "source" | "inference"; reason: string; apiUrl?: string; keywords?: string[]; evidence: ResearchEvidence[]; test: string; gaps: string[] }>; gaps: string[] }>;
+    groups: Array<{ taskId: string; priorityReason?: string; leaderboard?: ResearchEvidence | null; suitableModels?: Array<{ model: string; displayName?: string; origin?: "china" | "overseas"; reason: string; apiUrl?: string; keywords?: string[]; evidence: ResearchEvidence[] }>; candidates: Array<{ model: string; displayName?: string; origin?: "china" | "overseas"; role: string; mainRank?: number; fallbackRank?: number; mainStars?: number; fallbackStars?: number; mainReason?: string; fallbackReason?: string; basis?: "source" | "inference"; reason: string; apiUrl?: string; keywords?: string[]; evidence: ResearchEvidence[]; test: string; gaps: string[] }>; gaps: string[] }>;
     questions: string[];
   } | null;
 };
@@ -159,6 +176,8 @@ export const selectionApi = {
   conversations: () => invoke<{ view: ConversationView | null; conversations: ConversationSummary[] }>("selection_conversations"),
   openConversation: (sessionId: string, revision: number, view: ConversationView, targetId: string | null = null) => invoke<SelectionWorkspace>("selection_conversation_open", { sessionId, revision, view, targetId }),
   saveConversation: (sessionId: string, revision: number, view: ConversationView) => invoke<ConversationSummary[]>("selection_conversation_save", { sessionId, revision, view }),
+  pinConversation: (sessionId: string, revision: number, view: ConversationView, targetId: string, pinned: boolean) => invoke<SelectionWorkspace>("selection_conversation_pin", { sessionId, revision, view, targetId, pinned }),
+  deleteConversation: (sessionId: string, revision: number, view: ConversationView, targetId: string) => invoke<SelectionWorkspace>("selection_conversation_delete", { sessionId, revision, view, targetId }),
   openApi: (url: string) => invoke<void>("selection_open_api", { url }),
   get: () => invoke<SelectionSession>("selection_get"),
   reset: (sessionId: string) => invoke<SelectionSession>("selection_reset", { sessionId }),
@@ -166,12 +185,13 @@ export const selectionApi = {
   extract: (input: { sessionId: string; revision: number; requestId: string; description: string }) => invoke<SelectionSession>("selection_extract", { input }),
   selectTask: (sessionId: string, revision: number, taskId: string) => invoke<SelectionSession>("selection_select_task", { sessionId, revision, taskId }),
   confirm: (input: { sessionId: string; revision: number; requestId: string; card: RequirementCard }) => invoke<SelectionSession>("selection_confirm", { input }),
-  research: (sessionId: string, revision: number, taskId: string, retry = false) => {
+  research: (sessionId: string, revision: number, taskId: string, retry = false, more = false) => {
     const today = new Date();
     const asOfDate = [today.getFullYear(), String(today.getMonth() + 1).padStart(2, "0"), String(today.getDate()).padStart(2, "0")].join("-");
-    return invoke<SelectionSession>("research_command", { sessionId, revision, taskId, retry, asOfDate });
+    return invoke<SelectionSession>("research_command", { sessionId, revision, taskId, retry, asOfDate, ...(more ? { more: true } : {}) });
   },
   choose: (sessionId: string, revision: number, taskId: string, model: string, role: ModelRole) => invoke<SelectionSession>("selection_choose", { sessionId, revision, taskId, model, role }),
+  rate: (sessionId: string, revision: number, taskId: string, retry = false) => invoke<SelectionSession>("selection_rate", { sessionId, revision, taskId, retry }),
 };
 
 export function selectionError(error: unknown) {

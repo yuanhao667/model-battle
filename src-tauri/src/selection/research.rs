@@ -55,6 +55,14 @@ struct Candidate {
     main_rank: u8,
     #[serde(default)]
     fallback_rank: u8,
+    #[serde(default)]
+    main_stars: u8,
+    #[serde(default)]
+    fallback_stars: u8,
+    #[serde(default)]
+    main_reason: String,
+    #[serde(default)]
+    fallback_reason: String,
     #[serde(default = "source_basis")]
     basis: String,
     reason: String,
@@ -117,6 +125,147 @@ pub(super) struct Report {
     questions: Vec<String>,
 }
 impl Report {
+    pub(super) fn needs_ratings(&self) -> bool {
+        self.groups.iter().any(|group| {
+            group.candidates.iter().any(|model| {
+                !(1..=3).contains(&model.main_stars)
+                    || !(1..=3).contains(&model.fallback_stars)
+                    || model.main_reason.is_empty()
+                    || model.fallback_reason.is_empty()
+            }) || (group.candidates.len() > 1
+                && [true, false].iter().any(|main| {
+                    let stars = |model: &Candidate| {
+                        if *main {
+                            model.main_stars
+                        } else {
+                            model.fallback_stars
+                        }
+                    };
+                    group
+                        .candidates
+                        .iter()
+                        .all(|model| stars(model) == stars(&group.candidates[0]))
+                }))
+        })
+    }
+
+    pub(super) fn discard_legacy_ratings(&mut self) {
+        for model in self
+            .groups
+            .iter_mut()
+            .flat_map(|group| &mut group.candidates)
+        {
+            if model.main_reason.is_empty() && model.fallback_reason.is_empty() {
+                model.main_stars = 0;
+                model.fallback_stars = 0;
+            }
+        }
+    }
+
+    pub(super) fn rating_material(&self) -> serde_json::Value {
+        serde_json::json!(self.groups.iter().map(|group| serde_json::json!({"taskId":group.task_id,
+            "models":group.candidates.iter().map(|model| serde_json::json!({"model":model.model,"name":model.display_name,"reason":model.reason,"evidence":model.evidence})).collect::<Vec<_>>()
+        })).collect::<Vec<_>>())
+    }
+
+    pub(super) fn apply_ratings(&mut self, text: &str) -> AppResult<()> {
+        #[derive(Deserialize)]
+        #[serde(rename_all = "camelCase")]
+        struct Rating {
+            model: String,
+            main_stars: u8,
+            fallback_stars: u8,
+            main_reason: String,
+            fallback_reason: String,
+        }
+        #[derive(Deserialize)]
+        struct Response {
+            ratings: Vec<Rating>,
+        }
+        let response: Response = serde_json::from_str(text)
+            .map_err(|_| validation("星级响应格式不完整，请重试评级。"))?;
+        let mut next = self.clone();
+        let expected = self
+            .groups
+            .iter()
+            .map(|group| group.candidates.len())
+            .sum::<usize>();
+        if response.ratings.len() != expected {
+            return Err(validation("部分模型缺少评级，原名单已保留。"));
+        }
+        let mut seen = HashSet::new();
+        for rating in response.ratings {
+            if !seen.insert(rating.model.to_lowercase())
+                || !(1..=3).contains(&rating.main_stars)
+                || !(1..=3).contains(&rating.fallback_stars)
+                || rating.main_reason.trim().is_empty()
+                || rating.fallback_reason.trim().is_empty()
+                || rating.main_reason.chars().count() > 400
+                || rating.fallback_reason.chars().count() > 400
+            {
+                return Err(validation("评级或理由未完整返回，请重试评级。"));
+            }
+            let model = next
+                .groups
+                .iter_mut()
+                .flat_map(|group| &mut group.candidates)
+                .find(|model| model.model.eq_ignore_ascii_case(&rating.model))
+                .ok_or_else(|| validation("评级包含名单外型号，原名单已保留。"))?;
+            model.main_stars = rating.main_stars;
+            model.fallback_stars = rating.fallback_stars;
+            model.main_reason = rating.main_reason.trim().into();
+            model.fallback_reason = rating.fallback_reason.trim().into();
+        }
+        if next.needs_ratings() {
+            return Err(validation("评级未区分各型号的取舍，请重试评级。"));
+        }
+        *self = next;
+        Ok(())
+    }
+
+    pub(super) fn model_names(&self) -> Vec<String> {
+        self.groups
+            .iter()
+            .flat_map(|group| group.candidates.iter().map(|model| model.model.clone()))
+            .collect()
+    }
+
+    pub(super) fn append_candidates(&mut self, extra: Report) -> usize {
+        let mut added = 0;
+        for group in &mut self.groups {
+            if let Some(new_group) = extra
+                .groups
+                .iter()
+                .find(|item| item.task_id == group.task_id)
+            {
+                let mut count = 0;
+                for candidate in &new_group.candidates {
+                    if count == 5 {
+                        break;
+                    }
+                    if group.candidates.iter().any(|old| {
+                        old.model.eq_ignore_ascii_case(&candidate.model)
+                            || (!old.display_name.is_empty()
+                                && !candidate.display_name.is_empty()
+                                && old
+                                    .display_name
+                                    .eq_ignore_ascii_case(&candidate.display_name))
+                    }) {
+                        continue;
+                    }
+                    let mut candidate = candidate.clone();
+                    candidate.role = "candidate".into();
+                    candidate.main_rank = 0;
+                    candidate.fallback_rank = 0;
+                    group.candidates.push(candidate);
+                    count += 1;
+                }
+                added += count;
+            }
+        }
+        added
+    }
+
     pub(super) fn assign_recommendations(&mut self) {
         for group in &mut self.groups {
             let main = group
@@ -221,6 +370,20 @@ pub(super) struct ResearchResult {
     pub(super) sources: Vec<Source>,
     pub(super) report: Option<Report>,
     pub(super) error: String,
+    #[serde(default)]
+    pub(super) more_requested: bool,
+    #[serde(default)]
+    pub(super) more_added_count: usize,
+    #[serde(default)]
+    pub(super) more_error: String,
+    #[serde(default)]
+    pub(super) needs_ratings: bool,
+    #[serde(default)]
+    pub(super) rating_attempted: bool,
+    #[serde(default)]
+    pub(super) rating_error: String,
+    #[serde(default)]
+    pub(super) rating_version: u8,
 }
 
 pub(super) fn safe_url(value: &str) -> bool {
@@ -966,6 +1129,13 @@ fn response_evidence(value: Option<&serde_json::Value>) -> Vec<Evidence> {
         .collect()
 }
 
+fn response_stars(item: &serde_json::Value, key: &str) -> u8 {
+    item.get(key)
+        .and_then(|value| value.as_u64().or_else(|| value.as_str()?.parse().ok()))
+        .filter(|stars| (1..=3).contains(stars))
+        .unwrap_or(0) as u8
+}
+
 fn response_rank(item: &serde_json::Value, key: &str) -> u8 {
     item.get(key)
         .and_then(|rank| {
@@ -1066,6 +1236,16 @@ fn response_candidates(value: &serde_json::Value, keys: &[&str]) -> Vec<Candidat
                 ranking_evidence: item.get("rankingEvidence").and_then(response_evidence_item),
                 main_rank: response_rank(item, "mainRank"),
                 fallback_rank: response_rank(item, "fallbackRank"),
+                main_stars: response_stars(item, "mainStars"),
+                fallback_stars: response_stars(item, "fallbackStars"),
+                main_reason: response_string(item, &["mainReason"])
+                    .chars()
+                    .take(600)
+                    .collect(),
+                fallback_reason: response_string(item, &["fallbackReason"])
+                    .chars()
+                    .take(600)
+                    .collect(),
                 role: match (
                     response_rank(item, "mainRank"),
                     response_rank(item, "fallbackRank"),
@@ -1322,12 +1502,20 @@ pub(super) async fn run(
     settings: &AssistantSettings,
     connection: &Connection,
     key: String,
+    excluded_models: &[String],
     progress: impl Fn(&str),
     save_sources: impl Fn(Vec<Source>),
     stream_progress: impl Fn(&str, &str),
+    record_invocation: impl Fn(Invocation),
 ) -> AppResult<(Report, Vec<Source>)> {
     let web = web::DeepSeekWeb::new(&key)?;
-    let sources = collect(card, as_of_date, &web, &progress, save_sources).await;
+    let mut sources = collect(card, as_of_date, &web, &progress, save_sources).await;
+    let adding = !excluded_models.is_empty();
+    if adding {
+        for source in &mut sources {
+            source.id = format!("extra-{}", source.id);
+        }
+    }
     let requirements = serde_json::json!({
         "projectContext":card.project_context.as_ref().map(|field| &field.value),
         "targetUser":card.target_user.as_ref().map(|field| &field.value),
@@ -1336,6 +1524,15 @@ pub(super) async fn run(
         "tasks":card.tasks.iter().map(|task| serde_json::json!({"id":task.id,"name":task.name,"modalityRequirements":task_modalities(task),"userConcerns":task.user_concerns,"fields":task.fields.iter().filter(|(_, field)| !field.value.is_empty()).map(|(key, field)| (key.clone(), field.value.clone())).collect::<BTreeMap<_,_>>()})).collect::<Vec<_>>()
     });
     let mut material = serde_json::json!({"requirements":requirements,"asOfDate":as_of_date,"researchedAtMs":now_ms(),"sources":recommendation_sources(&sources, card.exclude_overseas).iter().map(|source| serde_json::json!({"id":source.id,"area":source.area,"url":source.url,"status":source.status,"content":recommendation_content(source, card)})).collect::<Vec<_>>()});
+    let initial_prompt = if adding {
+        material["excludedModels"] = serde_json::json!(excluded_models);
+        format!(
+            "{}\n本次只追加候选：保留原有名单，最多新增5个满足当前任务难度、输入输出和用户约束的不同型号。excludedModels是已推荐型号，不得重复，也不得用别名、日期版本或其他平台部署重复计数。不重新推荐主力或兜底，新增项role=candidate、mainRank=0、fallbackRank=0。沿用groups/candidates的JSON格式；不足5个可少给，不编造补足。",
+            include_str!("../prompts/selection_research.txt")
+        )
+    } else {
+        include_str!("../prompts/selection_research.txt").to_string()
+    };
     let mut last_error = validation("入围名单未生成完整，请重试。");
     let mut retained = None;
     let mut supplement_region = None;
@@ -1352,15 +1549,16 @@ pub(super) async fn run(
             key.clone(),
             &request_material,
             if attempt == 0 {
-                include_str!("../prompts/selection_research.txt")
+                &initial_prompt
             } else if supplement_region.is_some() {
-                "用户未限制模型地区。按missingRegion补充3个适合本任务的不同型号：china是国内，overseas是海外。只返回新增候选，不重复existingCandidates，不重做已有名单。主力侧重性价比，兜底侧重质量；apiUrl使用sources中该模型官方API文档或接入页的真实地址，不猜地址。若新增型号比已有主力或兜底更合适，role标main或fallback；否则role=candidate，不能为凑地区强改推荐。分别用mainRank、fallbackRank标注新增型号在该角色的第一推荐1、第二推荐2或未推荐0，主力和兜底分别比较。结合requirements和sources，给出模型名称、origin及35字内的一句适配理由，keywords提取理由原文中1～3个关键词，有可核验引用则附上，每项用kind标official_case、official_docs、benchmark或reference，label简述当前任务的具体用法，不能把新闻或目录冒充案例；没有则basis=inference、evidence=[]，不编造版本和事实。格式为 {\"groups\":[{\"taskId\":\"原任务ID\",\"candidates\":[{\"model\":\"实际型号或官方名称\",\"origin\":\"china或overseas\",\"reason\":\"一句适配理由\",\"basis\":\"inference\",\"evidence\":[]}]}]}。"
+                "用户未限制模型地区。按missingRegion补充3个适合本任务的不同型号：china是国内，overseas是海外。只返回新增候选，不重复existingCandidates，不重做已有名单。主力侧重性价比，兜底侧重质量；apiUrl使用sources中该模型官方API文档或接入页的真实地址，不猜地址。若新增型号比已有主力或兜底更合适，role标main或fallback；否则role=candidate，不能为凑地区强改推荐。分别用mainRank、fallbackRank标注新增型号在该角色的第一推荐1、第二推荐2或未推荐0，主力和兜底分别比较。结合requirements和sources，给出模型名称、origin及35字内的一句适配理由，keywords提取理由原文中1～3个关键词，独立给mainStars和fallbackStars各1～3星，每档数量不限，并用mainReason和fallbackReason分别解释星级。逐项有可核验引用则附上，每项用kind标official_case、official_docs、benchmark或reference，label简述当前任务的具体用法，不能把新闻或目录冒充案例；没有则basis=inference、evidence=[]，不编造版本和事实。格式为 {\"groups\":[{\"taskId\":\"原任务ID\",\"candidates\":[{\"model\":\"实际型号或官方名称\",\"origin\":\"china或overseas\",\"reason\":\"一句适配理由\",\"basis\":\"inference\",\"evidence\":[]}]}]}。"
             } else {
-                "你是JSON格式修复器。只整理previousResult中已经给出的模型与理由，不重新选型、不搜索、不分析、不编造补充型号。返回 {\"groups\":[{\"taskId\":\"给定任务ID\",\"candidates\":[{\"model\":\"原模型名称或ID\",\"origin\":\"china或overseas\",\"reason\":\"原推荐理由\",\"basis\":\"inference\",\"evidence\":[]}],\"suitableModels\":[]}]}。保留原有apiUrl、keywords、mainRank、fallbackRank、evidence的kind及label和明确的地区限制。"
+                "你是JSON格式修复器。只整理previousResult中已经给出的模型与理由，不重新选型、不搜索、不分析、不编造补充型号。返回 {\"groups\":[{\"taskId\":\"给定任务ID\",\"candidates\":[{\"model\":\"原模型名称或ID\",\"origin\":\"china或overseas\",\"reason\":\"原推荐理由\",\"basis\":\"inference\",\"evidence\":[]}],\"suitableModels\":[]}]}。保留原有apiUrl、keywords、mainRank、fallbackRank、mainStars、fallbackStars、mainReason、fallbackReason、evidence的kind及label和明确的地区限制。"
             },
             "调研结论",
             &progress,
             &stream_progress,
+            &record_invocation,
         );
         let generated = if supplement_region.is_some() {
             tokio::time::timeout(Duration::from_secs(20), request)
@@ -1392,7 +1590,8 @@ pub(super) async fn run(
                 if let Some(existing) = retained.take() {
                     return Ok((merge_supplement(existing, report), sources));
                 }
-                if supplement_region.is_none()
+                if !adding
+                    && supplement_region.is_none()
                     && let Some(region) = missing_region(&report, card.exclude_overseas)
                 {
                     material["existingCandidates"] =
@@ -1543,6 +1742,83 @@ mod tests {
             .join("\n");
         assert!(queries.contains("算法推理") && queries.contains("难度难"));
         assert!(!queries.contains("小参数模型") && !queries.contains("small mini nano"));
+    }
+
+    #[test]
+    fn legacy_ranks_do_not_become_star_ratings_and_regrading_is_atomic() {
+        let card = super::super::tests::card();
+        let models = (0..6).map(|index| serde_json::json!({"model":format!("m{index}"),"reason":"原有适配理由", "mainRank":if index==0{1}else if index==1{2}else{0}})).collect::<Vec<_>>();
+        let mut report =
+            parse_report(&serde_json::json!({"candidates":models}).to_string(), &card).unwrap();
+        report.assign_recommendations();
+        assert!(
+            report.groups[0]
+                .candidates
+                .iter()
+                .all(|model| model.main_stars == 0)
+        );
+        assert!(report.needs_ratings());
+        let before = serde_json::to_value(&report).unwrap();
+        for stars in [1, 2, 3] {
+            let ratings = (0..6).map(|index| serde_json::json!({"model":format!("m{index}"),"mainStars":stars,"fallbackStars":stars,"mainReason":"需求卡的成本要求需要核验","fallbackReason":"需求卡的质量要求需要校验"})).collect::<Vec<_>>();
+            assert!(
+                report
+                    .apply_ratings(&serde_json::json!({"ratings":ratings}).to_string())
+                    .is_err()
+            );
+            assert_eq!(serde_json::to_value(&report).unwrap(), before);
+        }
+        let ratings = (0..6).map(|index| serde_json::json!({"model":format!("m{index}"),"mainStars":if index<3{3}else{2},"fallbackStars":if index<3{2}else{3},"mainReason":"需求卡的低成本和JSON要求匹配","fallbackReason":"结构化校验能力能补救字段遗漏"})).collect::<Vec<_>>();
+        report
+            .apply_ratings(&serde_json::json!({"ratings":ratings}).to_string())
+            .unwrap();
+        assert!(!report.needs_ratings());
+        assert_eq!(
+            report.groups[0]
+                .candidates
+                .iter()
+                .filter(|model| model.main_stars == 3)
+                .count(),
+            3
+        );
+        assert_eq!(report.groups[0].candidates[0].reason, "原有适配理由");
+        assert_eq!(report.groups[0].candidates.len(), 6);
+    }
+
+    #[test]
+    fn independently_rates_multiple_models_and_only_appends_five_distinct_candidates() {
+        let card = super::super::tests::card();
+        let models = (0..10).map(|index| serde_json::json!({"model":format!("m{index}"),"reason":"适配当前任务。","mainStars":if index < 4 {3} else if index < 8 {2} else {1},"fallbackStars":if index < 5 {2} else {3},"mainReason":"小任务无需高成本推理。","fallbackReason":"复杂任务仍需校验。"})).collect::<Vec<_>>();
+        let mut report =
+            parse_report(&serde_json::json!({"candidates":models}).to_string(), &card).unwrap();
+        report.assign_recommendations();
+        assert_eq!(
+            report.groups[0]
+                .candidates
+                .iter()
+                .filter(|model| model.main_stars == 3)
+                .count(),
+            4
+        );
+        assert_eq!(
+            report.groups[0].candidates[0].main_reason,
+            "小任务无需高成本推理。"
+        );
+        let original = serde_json::to_value(&report.groups[0].candidates).unwrap();
+        let models = (8..18).map(|index| serde_json::json!({"model":format!("M{index}"),"reason":"新增的适配型号。","mainStars":3,"fallbackStars":3})).collect::<Vec<_>>();
+        let extra =
+            parse_report(&serde_json::json!({"candidates":models}).to_string(), &card).unwrap();
+        assert_eq!(report.append_candidates(extra), 5);
+        assert_eq!(report.groups[0].candidates.len(), 15);
+        assert_eq!(
+            serde_json::to_value(&report.groups[0].candidates[..10]).unwrap(),
+            original
+        );
+        assert!(
+            report.groups[0].candidates[10..]
+                .iter()
+                .all(|model| model.main_stars == 3)
+        );
     }
 
     #[test]
