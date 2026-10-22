@@ -11,6 +11,11 @@ vi.mock("@tauri-apps/api/event", () => ({
   listen: vi.fn().mockResolvedValue(() => undefined),
 }));
 
+async function openBattle() {
+  render(<App />);
+  await userEvent.click(screen.getByRole("button", { name: "模型 Battle" }));
+}
+
 const emptyConfig = { schemaVersion: 1, activeArenaType: "text", connections: [] };
 
 describe("App", () => {
@@ -26,12 +31,15 @@ describe("App", () => {
     vi.mocked(listen).mockResolvedValue(() => undefined);
   });
 
-  it("opens the homepage without touching anything but the config", async () => {
+  it("opens the centered selection homepage without invoking any model", async () => {
     render(<App />);
 
-    expect(await screen.findByRole("button", { name: "模型 Battle" })).toHaveAttribute("aria-current", "page");
-    expect(invoke).toHaveBeenCalledTimes(1);
+    expect(await screen.findByRole("button", { name: "模型选型" })).toHaveAttribute("aria-current", "page");
+    expect(screen.getByRole("heading", { name: "Model Battle" })).toBeVisible();
+    await waitFor(() => expect(invoke).toHaveBeenCalledWith("selection_conversations"));
+    expect(invoke).toHaveBeenCalledWith("selection_get");
     expect(invoke).toHaveBeenCalledWith("settings_get");
+    expect(invoke.mock.calls.every(([command]) => ["settings_get", "selection_get", "selection_conversations", "selection_conversation_save"].includes(command))).toBe(true);
   });
 
   it("switches empty arena types and opens the matching settings category", async () => {
@@ -47,7 +55,7 @@ describe("App", () => {
       return Promise.resolve({});
     });
     const user = userEvent.setup();
-    render(<App />);
+    await openBattle();
 
     await user.click(await screen.findByRole("button", { name: "视频生成模型" }));
     await waitFor(() => expect(screen.getByRole("button", { name: "视频生成模型" })).toHaveAttribute("aria-pressed", "true"));
@@ -62,7 +70,7 @@ describe("App", () => {
 
   it("keeps every connection path on one settings page", async () => {
     const user = userEvent.setup();
-    render(<App />);
+    await openBattle();
     await user.click(await screen.findByRole("button", { name: /添加模型连接/ }));
 
     expect(screen.getByRole("button", { name: "模型配置" })).toHaveAttribute("aria-current", "page");
@@ -95,10 +103,10 @@ describe("App", () => {
       return Promise.resolve({});
     });
     const user = userEvent.setup();
-    render(<App />);
+    await openBattle();
     await user.click(await screen.findByRole("button", { name: /添加模型连接/ }));
     await user.click(screen.getByRole("button", { name: /AIHubMix/ }));
-    await user.type(screen.getByLabelText(/API Key/), "test-key");
+    await user.type(screen.getByLabelText(/^API Key/), "test-key");
     await user.click(screen.getByRole("button", { name: "验证连接并加载模型" }));
     expect(screen.getAllByText("文本生成")).toHaveLength(2);
     expect(screen.getByText("支持图片理解")).toBeInTheDocument();
@@ -141,10 +149,10 @@ describe("App", () => {
       return Promise.resolve({});
     });
     const user = userEvent.setup();
-    render(<App />);
+    await openBattle();
     await user.click(await screen.findByRole("button", { name: /添加模型连接/ }));
     await user.click(screen.getByRole("button", { name: /AIHubMix/ }));
-    await user.type(screen.getByLabelText(/API Key/), "test-key");
+    await user.type(screen.getByLabelText(/^API Key/), "test-key");
     await user.click(screen.getByRole("button", { name: "验证连接并加载模型" }));
 
     expect(await screen.findByLabelText("Qwen/Qwen3-30B-A3B")).toBeInTheDocument();
@@ -202,10 +210,10 @@ describe("App", () => {
       return Promise.resolve({});
     });
     const user = userEvent.setup();
-    render(<App />);
+    await openBattle();
     await user.click(await screen.findByRole("button", { name: /添加模型连接/ }));
     await user.click(screen.getByRole("button", { name: /硅基流动/ }));
-    await user.type(screen.getByLabelText(/API Key/), "test-key");
+    await user.type(screen.getByLabelText(/^API Key/), "test-key");
     await user.click(screen.getByRole("button", { name: "验证连接并加载模型" }));
     await user.click(screen.getByRole("button", { name: "全部模型" }));
     await user.click(await screen.findByLabelText("chat-3B"));
@@ -260,13 +268,13 @@ describe("App", () => {
       return Promise.resolve({});
     });
     const user = userEvent.setup();
-    render(<App />);
+    await openBattle();
     await user.click(await screen.findByRole("button", { name: "模型配置" }));
     expect(await screen.findByText("支持图片理解")).toBeInTheDocument();
     await user.click(await screen.findByRole("button", { name: "编辑AIHubMix" }));
     expect(screen.getByRole("heading", { name: "编辑连接" })).toBeInTheDocument();
-    expect(screen.getByLabelText(/API Key/)).toHaveAttribute("type", "password");
-    const apiKeyInput = screen.getByLabelText(/API Key/);
+    expect(screen.getByLabelText(/^API Key/)).toHaveAttribute("type", "password");
+    const apiKeyInput = screen.getByLabelText(/^API Key/);
     expect(apiKeyInput).toHaveValue("••••••••");
     expect(apiKeyInput).toHaveAttribute("readonly");
     expect(apiKeyInput).toHaveAttribute("placeholder", "已保存在本软件");
@@ -306,12 +314,12 @@ describe("App", () => {
       return Promise.resolve({});
     });
     const user = userEvent.setup();
-    render(<App />);
+    await openBattle();
     await user.click(await screen.findByRole("button", { name: /添加模型连接/ }));
     await user.click(screen.getByRole("button", { name: /AIHubMix（梯子必须开全局模式）/ }));
 
     expect(screen.getByRole("heading", { name: "连接 AIHubMix" })).toBeInTheDocument();
-    expect(screen.getByLabelText(/API Key/)).toBeRequired();
+    expect(screen.getByLabelText(/^API Key/)).toBeRequired();
   });
 
   it("removes a model and confirms before removing its connection", async () => {
@@ -340,7 +348,7 @@ describe("App", () => {
       return Promise.resolve(true);
     });
     const user = userEvent.setup();
-    render(<App />);
+    await openBattle();
     await user.click(await screen.findByRole("button", { name: "模型配置" }));
 
     expect((await screen.findAllByText("文本生成模型")).length).toBeGreaterThan(0);
@@ -375,7 +383,7 @@ describe("App", () => {
       return Promise.resolve({});
     });
     const user = userEvent.setup();
-    render(<App />);
+    await openBattle();
     await user.click(await screen.findByRole("button", { name: "模型配置" }));
 
     expect(screen.getByText("缺少 API Key")).toBeInTheDocument();
@@ -408,7 +416,7 @@ describe("App", () => {
       }
       return Promise.resolve({});
     });
-    render(<App />);
+    await openBattle();
 
     expect(await screen.findByRole("heading", { name: "gpt-image-1" })).toBeInTheDocument();
     expect(screen.queryByRole("heading", { name: "gpt-5" })).not.toBeInTheDocument();
@@ -467,7 +475,7 @@ describe("App", () => {
       return Promise.resolve({});
     });
     const user = userEvent.setup();
-    render(<App />);
+    await openBattle();
     await user.click(await screen.findByRole("button", { name: "模型配置" }));
 
     expect(screen.getByText("gpt-5")).toBeInTheDocument();
@@ -515,11 +523,11 @@ describe("App", () => {
       return Promise.resolve({});
     });
     const user = userEvent.setup();
-    render(<App />);
+    await openBattle();
     await user.click(await screen.findByRole("button", { name: /添加模型连接/ }));
     await user.click(screen.getByRole("button", { name: /AIHubMix/ }));
     expect(screen.queryByRole("group", { name: "模型目录筛选" })).not.toBeInTheDocument();
-    await user.type(screen.getByLabelText(/API Key/), "test-key");
+    await user.type(screen.getByLabelText(/^API Key/), "test-key");
     await user.click(screen.getByRole("button", { name: "验证连接并加载模型" }));
     expect(screen.getByRole("button", { name: "全部模型" })).toBeEnabled();
     expect(screen.getByRole("button", { name: "文本生成模型" })).toBeEnabled();
@@ -569,12 +577,12 @@ describe("App", () => {
       return Promise.resolve({});
     });
     const user = userEvent.setup();
-    render(<App />);
+    await openBattle();
     await user.click(await screen.findByRole("button", { name: /添加模型连接/ }));
 
     await user.click(screen.getByRole("button", { name: /硅基流动/ }));
     expect(screen.queryByRole("group", { name: "模型目录筛选" })).not.toBeInTheDocument();
-    await user.type(screen.getByLabelText(/API Key/), "test-key");
+    await user.type(screen.getByLabelText(/^API Key/), "test-key");
     await user.click(screen.getByRole("button", { name: "验证连接并加载模型" }));
     expect(screen.getByRole("button", { name: "文本转音频" })).toBeEnabled();
     expect(screen.getByRole("button", { name: "音频转文本" })).toBeEnabled();
@@ -611,7 +619,7 @@ describe("App", () => {
       return Promise.resolve({});
     });
     const user = userEvent.setup();
-    render(<App />);
+    await openBattle();
 
     expect(await screen.findByRole("button", { name: "文本转音频" })).toHaveAttribute("aria-pressed", "true");
     expect(screen.getByRole("button", { name: "音频转文本" })).toHaveAttribute("aria-pressed", "false");
@@ -649,7 +657,7 @@ describe("App", () => {
       return Promise.resolve({});
     });
     const user = userEvent.setup();
-    render(<App />);
+    await openBattle();
 
     const voiceSelect = await screen.findByLabelText("生成音色");
     await user.click(voiceSelect);
@@ -694,7 +702,7 @@ describe("App", () => {
       return Promise.resolve({});
     });
     const user = userEvent.setup();
-    render(<App />);
+    await openBattle();
 
     // 还没跑过：卡片上不该出现"重新生成"这种点不动的图标
     expect(screen.queryByRole("button", { name: /重新生成/ })).not.toBeInTheDocument();
@@ -748,7 +756,7 @@ describe("App", () => {
       return Promise.resolve({});
     });
     const user = userEvent.setup();
-    render(<App />);
+    await openBattle();
 
     // 主页的音频转文本一开始是空的
     expect(await screen.findByText("添加一段音频，让所有语音识别模型同时转写")).toBeInTheDocument();
@@ -793,7 +801,7 @@ describe("App", () => {
       return Promise.resolve({});
     });
     const user = userEvent.setup();
-    render(<App />);
+    await openBattle();
 
     await user.type(await screen.findByPlaceholderText(/输入同一个问题/), "你好");
     await user.click(screen.getByRole("button", { name: "生成全部音频" }));
@@ -833,7 +841,7 @@ describe("App", () => {
       return Promise.resolve({});
     });
     const user = userEvent.setup();
-    render(<App />);
+    await openBattle();
 
     expect(await screen.findByText("添加一段音频，让所有语音识别模型同时转写")).toHaveClass("is-placeholder");
     const upload = await screen.findByLabelText(/添加音频/);
@@ -865,7 +873,7 @@ describe("App", () => {
       return Promise.resolve({});
     });
     const user = userEvent.setup({ applyAccept: false });
-    render(<App />);
+    await openBattle();
 
     await user.upload(await screen.findByLabelText(/添加音频/), new File(["audio"], "sample.ogg", { type: "audio/ogg" }));
 
@@ -890,7 +898,7 @@ describe("App", () => {
       });
       return Promise.resolve({});
     });
-    render(<App />);
+    await openBattle();
 
     expect(await screen.findByLabelText("视频生成比例")).toBeInTheDocument();
     expect(screen.getByLabelText("视频时长")).toBeInTheDocument();
@@ -917,7 +925,7 @@ describe("App", () => {
       return Promise.resolve({});
     });
     const user = userEvent.setup();
-    render(<App />);
+    await openBattle();
 
     // 先等 Arena 切到视频（切换会重建输入框，早拿到的引用会失效）
     expect(await screen.findByRole("button", { name: "生成全部视频" })).toBeInTheDocument();
@@ -952,7 +960,7 @@ describe("App", () => {
       return Promise.resolve({});
     });
     const user = userEvent.setup();
-    render(<App />);
+    await openBattle();
 
     const prompt = await screen.findByPlaceholderText(/输入同一个问题/);
     await user.type(prompt, "你好");
@@ -986,7 +994,7 @@ describe("App", () => {
       return Promise.resolve({});
     });
     const user = userEvent.setup();
-    render(<App />);
+    await openBattle();
 
     await user.type(await screen.findByPlaceholderText(/输入同一个问题/), "文本提示词");
 
@@ -1024,7 +1032,7 @@ describe("App", () => {
       return Promise.resolve({});
     });
     const user = userEvent.setup();
-    render(<App />);
+    await openBattle();
 
     const prompt = await screen.findByPlaceholderText(/输入同一个问题/);
     await user.type(prompt, "写一首短诗");
@@ -1077,7 +1085,7 @@ describe("App", () => {
     const user = userEvent.setup();
     // user-event 会接管 navigator.clipboard，所以要在 setup 之后再换成自己的 spy。
     Object.defineProperty(navigator, "clipboard", { value: { writeText }, configurable: true });
-    render(<App />);
+    await openBattle();
 
     await user.type(await screen.findByPlaceholderText(/输入同一个问题/), "介绍一下李白");
     await user.click(screen.getByRole("button", { name: "运行全部模型" }));
@@ -1145,7 +1153,7 @@ describe("App", () => {
       return Promise.resolve({});
     });
     const user = userEvent.setup();
-    render(<App />);
+    await openBattle();
 
     await user.type(await screen.findByPlaceholderText(/输入同一个问题/), "介绍一下李白");
     await user.click(screen.getByRole("button", { name: "运行全部模型" }));
@@ -1198,7 +1206,7 @@ describe("App", () => {
       return Promise.resolve({});
     });
     const user = userEvent.setup();
-    render(<App />);
+    await openBattle();
 
     await user.type(await screen.findByPlaceholderText(/输入同一个问题/), "介绍一下李白");
     await user.click(screen.getByRole("button", { name: "运行全部模型" }));
@@ -1233,7 +1241,7 @@ describe("App", () => {
       return Promise.resolve({});
     });
     const user = userEvent.setup();
-    render(<App />);
+    await openBattle();
 
     const status = await screen.findByRole("button", { name: /系统提示词/ });
     expect(status.querySelector(".system-prompt-dot")).not.toHaveClass("is-set");
@@ -1262,7 +1270,7 @@ describe("App", () => {
       return Promise.resolve({});
     });
     const user = userEvent.setup();
-    render(<App />);
+    await openBattle();
 
     // 文本模式：显示已设置
     const textStatus = await screen.findByRole("button", { name: /系统提示词/ });
@@ -1296,7 +1304,7 @@ describe("App", () => {
       return Promise.resolve({});
     });
     const user = userEvent.setup();
-    render(<App />);
+    await openBattle();
     await user.click(await screen.findByRole("button", { name: "模型配置" }));
 
     expect(screen.queryByRole("group", { name: "来源筛选" })).not.toBeInTheDocument();
@@ -1318,7 +1326,7 @@ describe("App", () => {
       return Promise.resolve({});
     });
     const user = userEvent.setup();
-    render(<App />);
+    await openBattle();
     await user.click(await screen.findByRole("button", { name: "模型配置" }));
 
     // 硅基流动那张添加卡片原地变成"已连接"卡片：右上角标签、摘要、编辑/删除
@@ -1353,16 +1361,16 @@ describe("App", () => {
       return Promise.resolve({});
     });
     const user = userEvent.setup();
-    render(<App />);
+    await openBattle();
     await user.click(await screen.findByRole("button", { name: "模型配置" }));
     await user.click(screen.getByRole("button", { name: "编辑硅基流动" }));
 
-    expect(screen.getByLabelText(/API Key/)).toHaveValue("•".repeat(51));
+    expect(screen.getByLabelText(/^API Key/)).toHaveValue("•".repeat(51));
   });
 
   it("closes the connection editor from the header icon", async () => {
     const user = userEvent.setup();
-    render(<App />);
+    await openBattle();
     await user.click(await screen.findByRole("button", { name: /添加模型连接/ }));
     await user.click(screen.getByRole("button", { name: /AIHubMix/ }));
     expect(screen.getByRole("heading", { name: "连接 AIHubMix" })).toBeInTheDocument();

@@ -5,6 +5,9 @@ import { getCurrentWindow } from "@tauri-apps/api/window";
 import DOMPurify from "dompurify";
 import { marked } from "marked";
 import "./App.css";
+import ModelSelection from "./ModelSelection";
+import SelectionDriverSettings from "./SelectionDriverSettings";
+import { AssistantSettings } from "./selection";
 
 type AppError = {
   code: string;
@@ -62,6 +65,7 @@ type AppConfig = {
   activeArenaType: OutputType;
   connections: Connection[];
   systemPrompts?: Partial<Record<OutputType, string>>;
+  selectionAssistant?: AssistantSettings;
 };
 
 const systemPromptHints: Record<OutputType, string> = {
@@ -701,7 +705,8 @@ function ResultCard({
 export default function App() {
   const [config, setConfig] = useState<AppConfig>(emptyConfig);
   const [loading, setLoading] = useState(true);
-  const [activePage, setActivePage] = useState<"arena" | "settings">("arena");
+  const [activePage, setActivePage] = useState<"selection" | "arena" | "settings">("selection");
+  const [selectionVisited, setSelectionVisited] = useState(true);
   const [settingsOutputType, setSettingsOutputType] = useState<OutputType>("text");
   const [sourceFilters, setSourceFilters] = useState<ProviderKind[]>(["aihubmix", "siliconflow", "openai_compatible"]);
   const [editor, setEditor] = useState<EditorState>();
@@ -1420,6 +1425,11 @@ export default function App() {
       <header className="topbar" onMouseDown={startWindowDrag}>
         <nav className="page-tabs" aria-label="主页面">
           <button
+            className={activePage === "selection" ? "is-active" : ""}
+            aria-current={activePage === "selection" ? "page" : undefined}
+            onClick={() => { setNotice(""); setSelectionVisited(true); setActivePage("selection"); }}
+          >模型选型</button>
+          <button
             className={activePage === "arena" ? "is-active" : ""}
             aria-current={activePage === "arena" ? "page" : undefined}
             onClick={() => { setNotice(""); setActivePage("arena"); }}
@@ -1435,7 +1445,13 @@ export default function App() {
         </nav>
       </header>
 
-      {activePage === "arena" ? (<div className="arena-page">
+      {selectionVisited && <ModelSelection
+        hidden={activePage !== "selection"}
+        assistant={config.selectionAssistant}
+        onAssistantSaved={(selectionAssistant) => setConfig((current) => ({ ...current, selectionAssistant }))}
+        onOpenSettings={() => { setSettingsOutputType(config.activeArenaType); setActivePage("settings"); }}
+      />}
+      {activePage === "selection" ? null : activePage === "arena" ? (<div className="arena-page">
       <div className="arena-switch-row">
         <nav className="type-filter arena-type-switch" aria-label="模型类型">
           {(["text", "image", "audio", "audio_to_text", "video"] as OutputType[]).map((outputType) => <button
@@ -1587,6 +1603,7 @@ export default function App() {
           <section className="settings-page" aria-label="模型配置">
             <div className={`settings-content ${editor ? "is-editing" : ""}`}>
               {!editor && <div className="settings-overview">
+                <h3 className="settings-block-title">模型 Battle AI</h3>
                 <div className="model-pool-filters">
                   <div className="type-filter" role="group" aria-label="模型池类型">
                     {settingsGroups.map(({ outputType, label }) => (
@@ -1959,6 +1976,8 @@ export default function App() {
                   </div>
                 </section>
               )}
+              {!editor && <SelectionDriverSettings assistant={config.selectionAssistant}
+                onSaved={(selectionAssistant) => setConfig((current) => ({ ...current, selectionAssistant }))} />}
             </div>
           </section>
       )}

@@ -15,6 +15,8 @@ use tauri::{Emitter, Manager, State};
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
+mod selection;
+
 const SCHEMA_VERSION: u32 = 1;
 const CREDENTIALS_FILE_NAME: &str = "credentials.json";
 const CONNECTION_TEST_PROMPT: &str = "请只回复：连接成功";
@@ -55,6 +57,8 @@ struct AppConfig {
     connections: Vec<Connection>,
     #[serde(default)]
     system_prompts: BTreeMap<String, String>,
+    #[serde(default)]
+    selection_assistant: selection::AssistantSettings,
 }
 
 impl Default for AppConfig {
@@ -64,6 +68,7 @@ impl Default for AppConfig {
             active_arena_type: "text".into(),
             connections: vec![],
             system_prompts: BTreeMap::new(),
+            selection_assistant: selection::AssistantSettings::default(),
         }
     }
 }
@@ -448,9 +453,13 @@ fn speech_request_body(
     response_format: &str,
 ) -> serde_json::Value {
     let model_lower = model_id.to_ascii_lowercase();
-    let is_semantic_voice = matches!(voice, "alloy" | "echo" | "fable" | "onyx" | "nova" | "shimmer");
+    let is_semantic_voice = matches!(
+        voice,
+        "alloy" | "echo" | "fable" | "onyx" | "nova" | "shimmer"
+    );
     let (input, voice) = if provider_kind == "siliconflow" {
-        let input = if model_lower.contains("moss-ttsd") && !prompt.trim_start().starts_with("[S1]") {
+        let input = if model_lower.contains("moss-ttsd") && !prompt.trim_start().starts_with("[S1]")
+        {
             format!("[S1]{prompt}")
         } else {
             prompt.to_string()
@@ -723,6 +732,12 @@ fn keep_latest_platform_connections(config: &mut AppConfig) -> bool {
 }
 
 fn load_config(path: &Path) -> AppResult<AppConfig> {
+    let mut config = load_config_file(path)?;
+    config.selection_assistant = selection::assistant_status(path);
+    Ok(config)
+}
+
+fn load_config_file(path: &Path) -> AppResult<AppConfig> {
     if !path.exists() {
         return Ok(AppConfig::default());
     }
@@ -800,7 +815,7 @@ fn write_credentials(path: &Path, keys: &HashMap<String, String>) -> AppResult<(
         .map_err(|_| AppError::new("UNKNOWN", "无法创建本地配置目录。", true))?;
     let bytes = serde_json::to_vec(keys)
         .map_err(|_| AppError::new("UNKNOWN", "无法生成本机 API Key 文件。", false))?;
-    let temp = path.with_file_name("credentials.tmp.json");
+    let temp = path.with_extension("tmp.json");
     let mut options = OpenOptions::new();
     options.create(true).truncate(true).write(true);
     #[cfg(unix)]
@@ -1271,7 +1286,9 @@ async fn read_text_stream(
         if started.elapsed() >= TEXT_TIMEOUT {
             return Err(timeout_error("文本生成", TEXT_TIMEOUT));
         }
-        let Some(bytes) = next_stream_chunk(&mut response, TEXT_STREAM_STALL_TIMEOUT, &cancellation).await? else {
+        let Some(bytes) =
+            next_stream_chunk(&mut response, TEXT_STREAM_STALL_TIMEOUT, &cancellation).await?
+        else {
             break;
         };
         let text = String::from_utf8_lossy(&bytes).into_owned();
@@ -1396,10 +1413,9 @@ async fn generate_text(
     match sink {
         Some(sink) => read_text_stream(response, sink, cancellation).await,
         None => {
-            let body: OpenAiResponse = response
-                .json()
-                .await
-                .map_err(|_| AppError::new("RESPONSE_INVALID", "模型返回了无法识别的数据。", false))?;
+            let body: OpenAiResponse = response.json().await.map_err(|_| {
+                AppError::new("RESPONSE_INVALID", "模型返回了无法识别的数据。", false)
+            })?;
             parse_openai_response(body)
         }
     }
@@ -1727,7 +1743,10 @@ async fn generate_audio(
         let result_url = qwen_audio_result_url(&body).ok_or_else(|| {
             AppError::new("RESPONSE_INVALID", "模型没有返回可下载的音频链接。", false)
         })?;
-        let download = http_client()?.get(result_url).timeout(MEDIA_DOWNLOAD_TIMEOUT).send();
+        let download = http_client()?
+            .get(result_url)
+            .timeout(MEDIA_DOWNLOAD_TIMEOUT)
+            .send();
         let download = tokio::select! {
             _ = cancellation.cancelled() => return Err(AppError::new("CANCELLED", "本次运行已结束。", false)),
             response = download => response.map_err(|error| connection_error(&error, "音频下载接口"))?,
@@ -2497,9 +2516,11 @@ async fn provider_models(
             }));
         }
         models.sort_unstable_by(|left, right| {
-            left.output_type
-                .cmp(&right.output_type)
-                .then_with(|| left.model_id.to_lowercase().cmp(&right.model_id.to_lowercase()))
+            left.output_type.cmp(&right.output_type).then_with(|| {
+                left.model_id
+                    .to_lowercase()
+                    .cmp(&right.model_id.to_lowercase())
+            })
         });
         models.dedup_by(|left, right| {
             left.output_type == right.output_type && left.model_id == right.model_id
@@ -3387,6 +3408,12 @@ pub fn run() {
                 clear_media_cache(&cache_dir.join("generated"), None);
             }
             let config_path = app.path().app_config_dir()?.join("config.json");
+            app.manage(
+                selection::SelectionState::load(
+                    config_path.with_file_name("selection-history.json"),
+                )
+                .map_err(|error| std::io::Error::other(error.message))?,
+            );
             let credentials_path = config_path.with_file_name(CREDENTIALS_FILE_NAME);
             app.manage(AppState {
                 config_path,
@@ -3398,6 +3425,18 @@ pub fn run() {
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
+            selection::selection_get,
+            selection::conversations::selection_conversations,
+            selection::conversations::selection_conversation_open,
+            selection::conversations::selection_conversation_save,
+            selection::selection_open_api,
+            selection::selection_reset,
+            selection::selection_assistant_set,
+            selection::selection_extract,
+            selection::selection_select_task,
+            selection::selection_confirm,
+            selection::research_command,
+            selection::selection_choose,
             settings_get,
             provider_models,
             connection_test,
@@ -3502,7 +3541,10 @@ mod tests {
         assert_eq!(body["stream"], serde_json::Value::Bool(false));
         stream_request_body(&mut body);
         assert_eq!(body["stream"], serde_json::Value::Bool(true));
-        assert_eq!(body["stream_options"]["include_usage"], serde_json::Value::Bool(true));
+        assert_eq!(
+            body["stream_options"]["include_usage"],
+            serde_json::Value::Bool(true)
+        );
     }
 
     #[test]
@@ -3676,8 +3718,7 @@ mod tests {
         );
         assert_eq!(silicon_female["voice"], "FunAudioLLM/CosyVoice2-0.5B:diana");
 
-        let moss =
-            speech_request_body("siliconflow", "fnlp/MOSS-TTSD-v0.5", "你好", "alex", "mp3");
+        let moss = speech_request_body("siliconflow", "fnlp/MOSS-TTSD-v0.5", "你好", "alex", "mp3");
         assert_eq!(moss["voice"], "fnlp/MOSS-TTSD-v0.5:alex");
         assert_eq!(moss["input"], "[S1]你好");
 
@@ -3791,11 +3832,31 @@ mod tests {
         assert!(stalled.message.contains("没有收到新的内容"));
 
         // 图片 / 音频 / 视频各自的兜底时长
-        assert!(timeout_error("连接测试", CONNECTION_TEST_TIMEOUT).message.contains("30 秒"));
-        assert!(timeout_error("图片生成", IMAGE_TIMEOUT).message.contains("3 分钟"));
-        assert!(timeout_error("音频合成", SPEECH_TIMEOUT).message.contains("2 分钟"));
-        assert!(timeout_error("音频转写", TRANSCRIBE_TIMEOUT).message.contains("3 分钟"));
-        assert!(timeout_error("视频生成", VIDEO_TASK_TIMEOUT).message.contains("10 分钟"));
+        assert!(
+            timeout_error("连接测试", CONNECTION_TEST_TIMEOUT)
+                .message
+                .contains("30 秒")
+        );
+        assert!(
+            timeout_error("图片生成", IMAGE_TIMEOUT)
+                .message
+                .contains("3 分钟")
+        );
+        assert!(
+            timeout_error("音频合成", SPEECH_TIMEOUT)
+                .message
+                .contains("2 分钟")
+        );
+        assert!(
+            timeout_error("音频转写", TRANSCRIBE_TIMEOUT)
+                .message
+                .contains("3 分钟")
+        );
+        assert!(
+            timeout_error("视频生成", VIDEO_TASK_TIMEOUT)
+                .message
+                .contains("10 分钟")
+        );
     }
 
     #[test]
@@ -3919,16 +3980,21 @@ mod tests {
         };
         let view = read_config_for_ui(&state).expect("read config for ui");
         assert_eq!(view.connections[0].credential_length, Some(13));
-        assert!(serde_json::to_string(&view)
-            .expect("serialize view")
-            .contains("\"credentialLength\":13"));
+        assert!(
+            serde_json::to_string(&view)
+                .expect("serialize view")
+                .contains("\"credentialLength\":13")
+        );
         let _ = fs::remove_dir_all(&directory);
     }
 
     #[test]
     fn merges_system_prompt_into_media_prompts() {
         let system = Some("保持冷色调".to_string());
-        assert_eq!(merge_system_prompt(&system, "一只猫"), "保持冷色调\n\n一只猫");
+        assert_eq!(
+            merge_system_prompt(&system, "一只猫"),
+            "保持冷色调\n\n一只猫"
+        );
         assert_eq!(merge_system_prompt(&Some("   ".into()), "一只猫"), "一只猫");
         assert_eq!(merge_system_prompt(&None, "一只猫"), "一只猫");
     }
@@ -3936,8 +4002,12 @@ mod tests {
     #[test]
     fn round_trips_system_prompts_per_arena_type() {
         let mut config = AppConfig::default();
-        config.system_prompts.insert("text".into(), "先给结论".into());
-        config.system_prompts.insert("image".into(), "冷色调".into());
+        config
+            .system_prompts
+            .insert("text".into(), "先给结论".into());
+        config
+            .system_prompts
+            .insert("image".into(), "冷色调".into());
         let encoded = serde_json::to_vec(&config).expect("config should serialize");
         let parsed = parse_config(&encoded).expect("config should parse");
         assert_eq!(
@@ -3950,17 +4020,20 @@ mod tests {
         );
 
         let legacy = br#"{"schemaVersion":1,"activeArenaType":"text","connections":[]}"#;
-        assert!(parse_config(legacy)
-            .expect("旧配置也要能解析")
-            .system_prompts
-            .is_empty());
+        assert!(
+            parse_config(legacy)
+                .expect("旧配置也要能解析")
+                .system_prompts
+                .is_empty()
+        );
     }
 
     #[test]
     fn supports_aihubmix_chat_audio_models() {
         assert!(uses_chat_audio_endpoint("aihubmix", "gpt-4o-audio-preview"));
         assert!(!uses_chat_audio_endpoint("aihubmix", "gpt-4o-mini-tts"));
-        let body = chat_audio_request_body("gpt-4o-audio-preview", "hello", "nova", Some("只读数字"));
+        let body =
+            chat_audio_request_body("gpt-4o-audio-preview", "hello", "nova", Some("只读数字"));
         assert_eq!(body["modalities"], serde_json::json!(["text", "audio"]));
         assert_eq!(body["audio"]["voice"], "nova");
         assert_eq!(body["messages"][0]["role"], "system");
@@ -4012,6 +4085,7 @@ mod tests {
             schema_version: SCHEMA_VERSION,
             active_arena_type: "text".into(),
             system_prompts: BTreeMap::new(),
+            selection_assistant: selection::AssistantSettings::default(),
             connections: vec![Connection {
                 id: "connection".into(),
                 display_name: "test".into(),
@@ -4050,6 +4124,7 @@ mod tests {
             schema_version: SCHEMA_VERSION,
             active_arena_type: "text".into(),
             system_prompts: BTreeMap::new(),
+            selection_assistant: selection::AssistantSettings::default(),
             connections: Vec::new(),
         };
         activate_output_type(&mut config, "video");
@@ -4070,6 +4145,7 @@ mod tests {
             schema_version: SCHEMA_VERSION,
             active_arena_type: "text".into(),
             system_prompts: BTreeMap::new(),
+            selection_assistant: selection::AssistantSettings::default(),
             connections: vec![
                 Connection {
                     id: "first".into(),
@@ -4146,6 +4222,7 @@ mod tests {
             schema_version: SCHEMA_VERSION,
             active_arena_type: "text".into(),
             system_prompts: BTreeMap::new(),
+            selection_assistant: selection::AssistantSettings::default(),
             connections: vec![
                 connection("aihubmix", "aihubmix", vec![model("gpt", "text")]),
                 connection(
@@ -4171,6 +4248,7 @@ mod tests {
             schema_version: SCHEMA_VERSION,
             active_arena_type: "text".into(),
             system_prompts: BTreeMap::new(),
+            selection_assistant: selection::AssistantSettings::default(),
             connections: vec![Connection {
                 id: "connection".into(),
                 display_name: "AIHubMix".into(),
@@ -4287,12 +4365,7 @@ mod tests {
         );
         assert_eq!(qwen["enable_thinking"], false);
 
-        let other = chat_request_body(
-            "gpt-5",
-            serde_json::Value::String("hi".into()),
-            None,
-            None,
-        );
+        let other = chat_request_body("gpt-5", serde_json::Value::String("hi".into()), None, None);
         assert!(other.get("enable_thinking").is_none());
     }
 
@@ -4340,6 +4413,7 @@ mod tests {
             schema_version: SCHEMA_VERSION,
             active_arena_type: "text".into(),
             system_prompts: BTreeMap::new(),
+            selection_assistant: selection::AssistantSettings::default(),
             connections: vec![Connection {
                 id: "siliconflow".into(),
                 display_name: "硅基流动".into(),
