@@ -48,6 +48,8 @@ export function priorityLabel(value: string): string {
 
 export type FieldKey = typeof requirementFields[number][0];
 export type AssistantSettings = { modelId: string; hasCredential: boolean };
+export type IntentOption = { id: string; name: string; work: string };
+export type IntentSelection = { options: IntentOption[]; selectedTaskId: string };
 export type ModelRole = "main" | "fallback";
 export type RequirementField = { value: string; source: "provided" | "missing" | "user"; evidence: string };
 export type RequirementTask = { id: string; name: string; userConcerns?: string[]; excludedUserConcerns?: string[]; fields: Record<FieldKey, RequirementField> };
@@ -79,7 +81,7 @@ export type SelectionSession = {
   description: string;
   running: boolean;
   storageError?: string;
-  intentSelections?: string[];
+  intentSelections?: Array<IntentSelection | string>;
   progress?: { message: string; startedAtMs: number; analysisPreview?: string; receivedChars?: number; modelStartedAtMs?: number | null; lastOutputAtMs?: number | null } | null;
   taskRuns?: Record<string, { research: ResearchResult | null; selectedModel: string | null; fallbackModel?: string | null }>;
   draft: RequirementCard | null;
@@ -119,6 +121,14 @@ export function emptyTask(): RequirementTask {
     id: crypto.randomUUID(), name: "待确认任务",
     fields: Object.fromEntries(requirementFields.map(([key]) => [key, { value: "", source: "missing", evidence: "" }])) as Record<FieldKey, RequirementField>,
   };
+}
+
+export function intentOptions(card: RequirementCard): IntentOption[] {
+  return card.tasks.map((task, index) => {
+    const goal = task.fields.businessGoal;
+    const work = goal.value.trim() || (goal.source !== "user" ? card.suggestions.find((item) => item.taskIndex === index && item.field === "businessGoal")?.value.trim() : "") || "";
+    return { id: task.id, name: task.name, work };
+  });
 }
 
 export function prefillSuggestions(card: RequirementCard): RequirementCard {
@@ -183,7 +193,7 @@ export const selectionApi = {
   reset: (sessionId: string) => invoke<SelectionSession>("selection_reset", { sessionId }),
   saveAssistant: (apiKey: string) => invoke<AssistantSettings>("selection_assistant_set", { input: { apiKey } }),
   extract: (input: { sessionId: string; revision: number; requestId: string; description: string }) => invoke<SelectionSession>("selection_extract", { input }),
-  selectTask: (sessionId: string, revision: number, taskId: string) => invoke<SelectionSession>("selection_select_task", { sessionId, revision, taskId }),
+  selectTask: (sessionId: string, revision: number, taskId: string, workDescriptions: Record<string, string> = {}) => invoke<SelectionSession>("selection_select_task", { sessionId, revision, taskId, workDescriptions }),
   confirm: (input: { sessionId: string; revision: number; requestId: string; card: RequirementCard }) => invoke<SelectionSession>("selection_confirm", { input }),
   research: (sessionId: string, revision: number, taskId: string, retry = false, more = false) => {
     const today = new Date();

@@ -254,6 +254,7 @@ impl SelectionState {
             {
                 migrate_legacy_io(card);
             }
+            research::invalidate_outdated_research(session);
             for run in session.task_runs.values_mut() {
                 if let Some(report) = run
                     .research

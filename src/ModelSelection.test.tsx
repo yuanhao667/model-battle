@@ -5,7 +5,7 @@ import ModelSelection from "./ModelSelection";
 import SelectionDriverSettings from "./SelectionDriverSettings";
 import SelectionResearch from "./SelectionResearch";
 import App from "./App";
-import { AssistantSettings, DEFAULT_ASSISTANT_MODEL, emptyTask, prefillSuggestions, RequirementCard, SelectionSession } from "./selection";
+import { AssistantSettings, DEFAULT_ASSISTANT_MODEL, emptyTask, prefillSuggestions, RequirementCard, SelectionSession, intentOptions } from "./selection";
 
 const { invoke } = vi.hoisted(() => ({ invoke: vi.fn() }));
 vi.mock("@tauri-apps/api/core", () => ({ invoke, convertFileSrc: (path: string) => path }));
@@ -667,18 +667,24 @@ describe("model selection", () => {
     expect(screen.queryByRole("checkbox", { name: /互动课件生成|HTML|神奇|填槽|意图识别|文本生成/ })).not.toBeInTheDocument();
   });
 
-  it("selects an intent in one click and keeps the choice in chat without extra model calls", async () => {
+  it.each(["provided", "suggested"])("shows the %s work description and preserves it when choosing a step without extra model calls", async (source) => {
     const user = userEvent.setup();
     const draft = card();
     const second = emptyTask(); second.name = "课时编排";
-    second.fields.businessGoal = { value: "安排课程环节", source: "user", evidence: "" };
+    second.fields.businessGoal = source === "provided" ? { value: "安排课程环节", source: "user", evidence: "" } : { value: "", source: "missing", evidence: "" };
     draft.tasks.push(second);
+    draft.suggestions.push({ id: "second-work", taskIndex: 1, field: "businessGoal", value: source === "suggested" ? "安排课程环节" : "陈旧的工作说明", reason: "根据当前需求", accepted: false });
     draft.suggestions.push({ id: "second-priority", taskIndex: 1, field: "priorities", value: "速度", reason: "推荐", accepted: false });
     let current: SelectionSession = { ...initial(), revision: 1, description: draft.description, draft };
     invoke.mockImplementation((command: string, args: any) => {
       if (command === "selection_select_task") {
         const index = draft.tasks.findIndex((task) => task.id === args.taskId);
-        current = { ...current, revision: 2, intentSelections: [draft.tasks[index].name], draft: { ...draft, tasks: [draft.tasks[index]], suggestions: draft.suggestions.filter((item) => item.taskIndex === index).map((item) => ({ ...item, taskIndex: 0 })) } };
+        for (const task of draft.tasks) {
+          if (args.workDescriptions?.[task.id] !== undefined) {
+            task.fields.businessGoal = { value: args.workDescriptions[task.id], source: "user", evidence: "" };
+          }
+        }
+        current = { ...current, revision: 2, intentSelections: [{ options: intentOptions(draft), selectedTaskId: draft.tasks[index].id }], draft: { ...draft, tasks: [draft.tasks[index]], suggestions: draft.suggestions.filter((item) => item.taskIndex === index).map((item) => ({ ...item, taskIndex: 0 })) } };
       }
       return Promise.resolve(current);
     });
@@ -686,15 +692,32 @@ describe("model selection", () => {
     const choice = await screen.findByRole("region", { name: "选择选型环节" });
     expect(screen.queryByRole("group", { name: "需求确认卡片" })).not.toBeInTheDocument();
     expect(screen.queryByRole("button", { name: "确认此环节" })).not.toBeInTheDocument();
+    expect(within(choice).getByRole("textbox", { name: "会议转写的工作说明" })).toHaveValue("将会议录音转成文字");
+    const explanation = within(choice).getByRole("textbox", { name: "课时编排的工作说明" });
+    expect(explanation).toHaveValue("安排课程环节");
+    expect(within(choice).queryByDisplayValue("陈旧的工作说明")).not.toBeInTheDocument();
+    await user.clear(explanation);
+    await user.type(explanation, "只分配每课时主题，不安排教学活动");
     await user.click(within(choice).getByRole("radio", { name: "课时编排" }));
+    expect(invoke.mock.calls.filter(([command]) => command === "selection_select_task")).toHaveLength(0);
+    await user.click(within(choice).getByRole("button", { name: "确认选择" }));
     expect(await screen.findByRole("textbox", { name: "选型场景" })).toHaveValue("课时编排");
     expect(screen.getByText("这次先为哪个 AI 环节选模型？")).toBeVisible();
-    expect(screen.getByText("本次选择：课时编排")).toBeVisible();
-    expect(screen.getByRole("textbox", { name: "任务 1：希望 AI 完成" })).toHaveValue("安排课程环节");
+    const record = screen.getByRole("region", { name: "已选择的选型环节" });
+    expect(record).toHaveClass("selection-intent-history");
+    expect(within(record).getByRole("radio", { name: "课时编排" })).toBeChecked();
+    expect(within(record).getByRole("radio", { name: "课时编排" })).toBeDisabled();
+    expect(within(record).getByRole("radio", { name: "会议转写" })).not.toBeChecked();
+    expect(within(record).getByRole("radio", { name: "会议转写" })).toBeDisabled();
+    expect(within(record).getByText("只分配每课时主题，不安排教学活动")).toBeVisible();
+    expect(within(record).getByText("将会议录音转成文字")).toBeVisible();
+    expect(record.compareDocumentPosition(screen.getByRole("group", { name: "需求确认卡片" })) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
+    expect(screen.queryByText("本次选择：课时编排")).not.toBeInTheDocument();
+    expect(screen.getByRole("textbox", { name: "任务 1：希望 AI 完成" })).toHaveValue("只分配每课时主题，不安排教学活动");
     expect(screen.getByRole("checkbox", { name: "速度" })).toBeChecked();
     expect(screen.queryByRole("region", { name: "选择选型环节" })).not.toBeInTheDocument();
     expect(screen.queryByRole("tablist")).not.toBeInTheDocument();
-    expect(invoke).toHaveBeenCalledWith("selection_select_task", { sessionId: "session", revision: 1, taskId: second.id });
+    expect(invoke).toHaveBeenCalledWith("selection_select_task", { sessionId: "session", revision: 1, taskId: second.id, workDescriptions: { [second.id]: "只分配每课时主题，不安排教学活动" } });
     expect(invoke.mock.calls.filter(([command]) => command === "selection_extract" || command === "research_command")).toHaveLength(0);
   });
 
@@ -703,21 +726,32 @@ describe("model selection", () => {
     const draft = card(); draft.tasks.push({ ...emptyTask(), name: "HTML 生成" });
     invoke.mockImplementation((command: string) => command === "selection_select_task" ? Promise.reject({ message: "选择暂时失败" }) : Promise.resolve({ ...initial(), draft }));
     mount();
-    await user.click(await screen.findByRole("radio", { name: "HTML 生成" }));
+    await user.type(await screen.findByRole("textbox", { name: "HTML 生成的工作说明" }), "生成可运行的HTML页面");
+    await user.click(screen.getByRole("radio", { name: "HTML 生成" }));
+    await user.click(screen.getByRole("button", { name: "确认选择" }));
     expect(await screen.findByText("选择暂时失败")).toBeVisible();
     expect(screen.getByRole("radio", { name: "HTML 生成" })).toBeChecked();
     expect(screen.getByRole("radio", { name: "HTML 生成" })).toBeEnabled();
     expect(screen.queryByRole("group", { name: "需求确认卡片" })).not.toBeInTheDocument();
     expect(screen.queryByText("本次选择：HTML 生成")).not.toBeInTheDocument();
-    await user.click(screen.getByRole("radio", { name: "HTML 生成" }));
+    expect(screen.getByRole("textbox", { name: "HTML 生成的工作说明" })).toHaveValue("生成可运行的HTML页面");
+    await user.click(screen.getByRole("button", { name: "确认选择" }));
     expect(invoke.mock.calls.filter(([command]) => command === "selection_select_task")).toHaveLength(2);
   });
 
-  it("restores the choice record from the session when reopening the page", async () => {
-    invoke.mockResolvedValue({ ...initial(), draft: card(), intentSelections: ["会议转写"] });
+  it.each(["legacy", "record"])("restores the %s choice record from the session when reopening the page", async (version) => {
+    const draft = card();
+    const saved = { options: [...intentOptions(draft), { id: "other", name: "整理摘要", work: "提取会议结论和待办事项" }], selectedTaskId: draft.tasks[0].id };
+    invoke.mockResolvedValue({ ...initial(), draft, intentSelections: version === "legacy" ? ["会议转写"] : [saved] });
     mount();
-    expect(await screen.findByText("本次选择：会议转写")).toBeVisible();
-    expect(screen.getByText("这次先为哪个 AI 环节选模型？")).toBeVisible();
+    const record = await screen.findByRole("region", { name: "已选择的选型环节" });
+    expect(within(record).getByRole("radio", { name: "会议转写" })).toBeChecked();
+    expect(within(record).getByRole("radio", { name: "会议转写" })).toBeDisabled();
+    if (version === "record") {
+      expect(within(record).getByRole("radio", { name: "整理摘要" })).not.toBeChecked();
+      expect(within(record).getByText("提取会议结论和待办事项")).toBeVisible();
+    }
+    expect(screen.queryByText("本次选择：会议转写")).not.toBeInTheDocument();
     expect(screen.getByRole("textbox", { name: "选型场景" })).toHaveValue("会议转写");
   });
 

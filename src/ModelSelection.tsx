@@ -4,10 +4,28 @@ import SelectionResearch from "./SelectionResearch";
 import SelectionDriverSettings from "./SelectionDriverSettings";
 import {
   ASSISTANT_CONTEXT_TOKENS, ASSISTANT_MODEL_LABEL, DEFAULT_ASSISTANT_MODEL, AssistantSettings, ConversationSummary, ConversationView, SelectionWorkspace, emptyTask, FieldKey, RequirementCard,
-  prefillSuggestions, priorityOptions, selectedPriorities, priorityLabel, requirementFields, selectionContextFields, selectionApi, selectionError, SelectionSession, taskTypes, userScenarioValue,
+  prefillSuggestions, priorityOptions, selectedPriorities, priorityLabel, requirementFields, selectionContextFields, selectionApi, selectionError, SelectionSession, taskTypes, userScenarioValue, IntentOption, intentOptions,
 } from "./selection";
 
 type EditableConcern = { label: string; selected: boolean };
+
+function IntentChoices({ options, selectedId, prefix, recorded = false, busy = false, onSelect, onWorkChange, onConfirm }: {
+  options: IntentOption[]; selectedId: string; prefix: string; recorded?: boolean; busy?: boolean;
+  onSelect?: (id: string) => void; onWorkChange?: (id: string, work: string) => void; onConfirm?: () => void;
+}) {
+  return <section className={`selection-assistant-message selection-intent-choice${recorded ? " selection-intent-history" : ""}`} aria-label={recorded ? "已选择的选型环节" : "选择选型环节"}>
+    <h2>这次先为哪个 AI 环节选模型？</h2>
+    {!recorded && <p className="selection-hint">工作说明可直接修改，确认后按你的描述选型。</p>}
+    <div className="selection-intent-options" role="radiogroup" aria-label={recorded ? "选型环节选择记录" : "选择一个 AI 环节"}>{options.map((option) => <div className="selection-intent-option" key={option.id}>
+      <label>
+        <input type="radio" name={prefix} value={option.id} aria-labelledby={`${prefix}-name-${option.id}`} aria-describedby={recorded && option.work ? `${prefix}-work-${option.id}` : undefined} checked={selectedId === option.id} disabled={recorded || busy} onChange={() => onSelect?.(option.id)} />
+        <span className="selection-intent-text"><span id={`${prefix}-name-${option.id}`}>{option.name}</span>{recorded && option.work && <small id={`${prefix}-work-${option.id}`}>{option.work}</small>}</span>
+      </label>
+      {!recorded && <textarea className="selection-intent-work" aria-label={`${option.name}的工作说明`} rows={1} maxLength={4000} value={option.work} disabled={busy} placeholder="描述希望 AI 处理什么、做什么、输出什么" ref={resizeContextField} onChange={(event) => { resizeContextField(event.target); onWorkChange?.(option.id, event.target.value); }} />}
+    </div>)}</div>
+    {!recorded && <button className="primary-button" type="button" disabled={busy || !options.some((option) => option.id === selectedId && option.work.trim())} onClick={onConfirm}>{busy ? "确认中…" : "确认选择"}</button>}
+  </section>;
+}
 
 function PinIcon() {
   return <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M9 3h6M10 3v5l-4 4v3h12v-3l-4-4V3M12 15v6" /></svg>;
@@ -35,6 +53,7 @@ export default function ModelSelection({ hidden, assistant, onAssistantSaved, on
   const [newConcern, setNewConcern] = useState<{ taskId: string; value: string } | null>(null);
   const [editing, setEditing] = useState(false);
   const [intentId, setIntentId] = useState("");
+  const [intentWorkEdits, setIntentWorkEdits] = useState<Record<string, string>>({});
   const [busy, setBusy] = useState<"loading" | "extracting" | "confirming" | "researching" | "switching" | "">("loading");
   const busyRef = useRef(false);
   const ratingAttempts = useRef(new Set<string>());
@@ -70,6 +89,7 @@ export default function ModelSelection({ hidden, assistant, onAssistantSaved, on
     setNewConcern(null);
     setSession(value);
     const next = value.confirmed?.card ?? (value.draft?.tasks.length === 1 ? prefillSuggestions(value.draft) : undefined);
+    setIntentWorkEdits({});
     if (value.draft && value.draft.tasks.length > 1) setIntentId("");
     setCard(next);
     setEditing(!value.confirmed);
@@ -139,7 +159,7 @@ export default function ModelSelection({ hidden, assistant, onAssistantSaved, on
   }, [session?.progress?.analysisPreview]);
   useEffect(() => {
     const target = working ? ".selection-pending" : confirmed ? ".selection-confirmed" : !session?.confirmed && session?.intentSelections?.length ? ".selection-intent-history:last-child" : ".selection-card";
-    if (!hidden) transcriptRef.current?.querySelector(target)?.scrollIntoView?.({ block: "start" });
+    if (!hidden) transcriptRef.current?.querySelector(target)?.scrollIntoView?.({ block: "start", behavior: window.matchMedia?.("(prefers-reduced-motion: reduce)").matches ? "auto" : "smooth" });
   }, [card?.tasks[0]?.id, hidden, working, confirmed, session?.intentSelections?.length]);
   useEffect(() => {
     if (!working) return;
@@ -282,7 +302,7 @@ export default function ModelSelection({ hidden, assistant, onAssistantSaved, on
   async function selectIntent(taskId: string) {
     if (!session || busyRef.current) return;
     busyRef.current = true; setBusy("confirming"); setError("");
-    try { applySession(await selectionApi.selectTask(session.id, session.revision, taskId)); }
+    try { applySession(await selectionApi.selectTask(session.id, session.revision, taskId, intentWorkEdits)); }
     catch (cause) { setError(selectionError(cause)); }
     finally { busyRef.current = false; setBusy(""); }
   }
@@ -327,18 +347,12 @@ export default function ModelSelection({ hidden, assistant, onAssistantSaved, on
     <div className="selection-transcript" ref={transcriptRef} role="log" aria-label="选型对话" aria-live="polite" hidden={landing}>
     <div className="selection-transcript-content">
       {messages.map((message, index) => <article className="selection-user-message" key={index}><p>{message}</p></article>)}
-      <div>{session?.intentSelections?.map((name, index) => <div className="selection-intent-history" key={index}>
-        <div className="selection-assistant-message"><p>这次先为哪个 AI 环节选模型？</p></div>
-        <article className="selection-user-message"><p>本次选择：{name}</p></article>
-      </div>)}</div>
+      <div>{session?.intentSelections?.map((record, index) => {
+        const choice = typeof record === "string" ? { selectedTaskId: "legacy", options: [{ id: "legacy", name: record, work: "" }] } : record;
+        return <IntentChoices key={index} options={choice.options} selectedId={choice.selectedTaskId} prefix={`intent-history-${index}`} recorded />;
+      })}</div>
       {busy === "loading" && <p className="selection-hint" role="status">正在读取需求…</p>}
-      {intents.length > 1 && <section className="selection-assistant-message selection-intent-choice" aria-label="选择选型环节">
-        <h2>这次先为哪个 AI 环节选模型？</h2>
-        <div className="selection-intent-options" role="radiogroup" aria-label="选择一个 AI 环节">{intents.map((task) => <label key={task.id}>
-          <input type="radio" name="selection-intent" value={task.id} checked={intentId === task.id} disabled={Boolean(busy)} onChange={() => setIntentId(task.id)} onClick={() => void selectIntent(task.id)} />
-          <span>{task.name}</span>
-        </label>)}</div>
-      </section>}
+      {intents.length > 1 && session?.draft && <IntentChoices options={intentOptions(session.draft).map((option) => ({ ...option, work: intentWorkEdits[option.id] ?? option.work }))} selectedId={intentId} prefix="intent-pending" busy={Boolean(busy)} onSelect={setIntentId} onWorkChange={(id, work) => setIntentWorkEdits((current) => ({ ...current, [id]: work }))} onConfirm={() => void selectIntent(intentId)} />}
       {card && <div className={`selection-requirements${confirmed ? " is-confirmed" : ""}`} role="group" aria-label="需求确认卡片">
       <section role="region" aria-label={activeTask?.name}>
       {card.tasks.map((task, taskIndex) => {

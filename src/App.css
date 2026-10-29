@@ -522,9 +522,16 @@ h1, h2, h3 { font-weight: 400; }
 .selection-page .selection-project-context input { border: 0; border-bottom: 1px solid var(--divider-soft); border-radius: 0; background: transparent; padding: 7px 0; }
 .selection-intent-choice h2 { margin-bottom: 14px; }
 .selection-intent-options { display: grid; gap: 12px; margin-bottom: 18px; }
-.selection-intent-options label { display: flex; align-items: center; gap: 8px; font-size: 13px; cursor: pointer; }
+.selection-intent-options label { display: flex; align-items: flex-start; gap: 8px; font-size: 13px; cursor: pointer; }
 .selection-intent-options input[type="radio"] { flex: 0 0 auto; width: 14px; height: 14px; padding: 0; accent-color: var(--accent); }
 .selection-intent-options input:not(:checked) + span { color: var(--muted); }
+.selection-intent-options input[type="radio"] { margin-top: 2px; }
+.selection-intent-history .selection-intent-options label, .selection-intent-history input:disabled { cursor: default; }
+.selection-intent-history { margin-bottom: 24px; }
+.selection-page .selection-intent-work { display: block; margin: 4px 0 0 22px; width: calc(100% - 22px); min-height: 20px; padding: 0; border: 0; border-bottom: 1px solid transparent; border-radius: 0; background: transparent; color: var(--muted); font-size: 12px; line-height: 1.6; resize: vertical; }
+.selection-page .selection-intent-work:focus { border-bottom-color: var(--divider-soft); color: var(--color-ink); }
+.selection-intent-text { display: grid; gap: 4px; min-width: 0; }
+.selection-intent-text small { color: var(--muted); font-size: 12px; font-weight: 400; line-height: 1.6; overflow-wrap: anywhere; }
 
 .research-api-link { text-align: center; font-size: 12px; color: #d5d5d5; }
 

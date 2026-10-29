@@ -384,6 +384,8 @@ pub(super) struct ResearchResult {
     pub(super) rating_error: String,
     #[serde(default)]
     pub(super) rating_version: u8,
+    #[serde(default)]
+    pub(super) resource_policy_version: u8,
 }
 
 pub(super) fn safe_url(value: &str) -> bool {
@@ -893,6 +895,206 @@ fn task_modalities(task: &RequirementTask) -> Vec<serde_json::Value> {
     .collect()
 }
 
+// Initial discovery boundary, not a measured latency or quality guarantee.
+const EASY_TASK_MAX_PARAMETERS_B: f64 = 14.0;
+pub(super) const RESOURCE_POLICY_VERSION: u8 = 1;
+
+fn intent_classification(task: &RequirementTask) -> bool {
+    let task_type = task
+        .fields
+        .get("taskType")
+        .map_or("", |field| field.value.as_str());
+    if !["", "文生文"].contains(&task_type) {
+        return false;
+    }
+    // Only inspect the selected step, never its project background or downstream tasks.
+    [
+        task.name.as_str(),
+        task.fields
+            .get("taskFocus")
+            .map_or("", |field| field.value.as_str()),
+        task.fields
+            .get("businessGoal")
+            .map_or("", |field| field.value.as_str()),
+    ]
+    .iter()
+    .any(|value| {
+        let lower = value.to_lowercase();
+        [
+            "意图识别",
+            "意图分类",
+            "意图路由",
+            "intent recognition",
+            "intent classification",
+            "intent detection",
+            "intent routing",
+        ]
+        .iter()
+        .any(|term| lower.contains(term))
+    })
+}
+
+pub(super) fn invalidate_outdated_research(session: &mut SelectionSession) {
+    let Some(card) = session
+        .confirmed
+        .as_ref()
+        .map(|confirmed| &confirmed.card)
+        .or(session.draft.as_ref())
+    else {
+        return;
+    };
+    for task in card.tasks.iter().filter(|task| lightweight_selection(task)) {
+        if let Some(run) = session.task_runs.get_mut(&task.id)
+            && let Some(result) = &mut run.research
+            && result.resource_policy_version < RESOURCE_POLICY_VERSION
+            && result.report.is_some()
+        {
+            result.report = None;
+            result.status = "failed".into();
+            result.error = "选型规则已更新：当前任务需按14B及以内重新筛选，请重新生成推荐。".into();
+            result.needs_ratings = false;
+            result.more_requested = false;
+            run.selected_model = None;
+            run.fallback_model = None;
+        }
+    }
+}
+
+fn lightweight_selection(task: &RequirementTask) -> bool {
+    let value = |key: &str| {
+        task.fields
+            .get(key)
+            .map_or("", |field| field.value.as_str())
+    };
+    let priorities = priority_values(value("priorities")).unwrap_or_default();
+    intent_classification(task)
+        || (value("taskType") == "文生文"
+            && value("taskDifficulty") == "易"
+            && !priorities.is_empty()
+            && !priorities.contains(&"准确性")
+            && priorities
+                .iter()
+                .any(|value| ["速度", "成本"].contains(value)))
+}
+
+// Read total scale, never confuse A3B activation or the 3.5 version with total parameters.
+fn named_parameters_b(name: &str) -> Option<f64> {
+    let lower = name.to_ascii_lowercase();
+    let bytes = lower.as_bytes();
+    let mut largest: Option<f64> = None;
+    for (end, unit) in bytes.iter().enumerate() {
+        if !matches!(unit, b'b' | b't') || end == 0 {
+            continue;
+        }
+        if bytes.get(end + 1).is_some_and(u8::is_ascii_alphabetic) {
+            continue;
+        }
+        let mut start = end;
+        while start > 0 && (bytes[start - 1].is_ascii_digit() || bytes[start - 1] == b'.') {
+            start -= 1;
+        }
+        if start == end || (start > 0 && bytes[start - 1] == b'a') {
+            continue;
+        }
+        if let Ok(number) = lower[start..end].parse::<f64>() {
+            let number = number * if *unit == b't' { 1000.0 } else { 1.0 };
+            largest = Some(largest.map_or(number, |previous| previous.max(number)));
+        }
+    }
+    largest
+}
+
+fn validate_resource_fit(
+    report: &Report,
+    card: &RequirementCard,
+    sources: &[Source],
+) -> AppResult<()> {
+    for group in &report.groups {
+        if !card
+            .tasks
+            .iter()
+            .any(|task| task.id == group.task_id && lightweight_selection(task))
+        {
+            continue;
+        }
+        for model in &group.candidates {
+            if !sources.iter().any(|source| {
+                official_evidence_domain(&source.url, &model.api_url)
+                    && verified_model_id(
+                        &model.model,
+                        &model.display_name,
+                        std::slice::from_ref(source),
+                    )
+            }) {
+                return Err(validation(&format!(
+                    "型号未通过官方资料核验：{}。请优先选择主流厂商、官方资料可核对的当前型号，不按名称拼接专项版本，不为数量补入未经核验的型号。",
+                    model.model
+                )));
+            }
+            let scale = named_parameters_b(&model.model).or_else(|| {
+                // A generated display label cannot provide a missing parameter scale.
+                sources
+                    .iter()
+                    .any(|source| {
+                        source.status == "read"
+                            && official_evidence_domain(&source.url, &model.api_url)
+                            && !model.display_name.is_empty()
+                            && source.text.contains(&model.display_name)
+                    })
+                    .then(|| named_parameters_b(&model.display_name))
+                    .flatten()
+            });
+            let fits = match scale {
+                Some(total) => total > 0.0 && total <= EASY_TASK_MAX_PARAMETERS_B,
+                None if card
+                    .tasks
+                    .iter()
+                    .any(|task| task.id == group.task_id && intent_classification(task)) =>
+                {
+                    false
+                }
+                None => model.evidence.iter().any(|evidence| {
+                    let quote = evidence.quote.to_ascii_lowercase();
+                    let lightweight = [
+                        "lightweight",
+                        "small model",
+                        "smallest",
+                        "mini model",
+                        "nano model",
+                        "轻量",
+                        "小模型",
+                        "小型模型",
+                    ]
+                    .iter()
+                    .any(|word| quote.contains(word));
+                    lightweight
+                        && verified_evidence(std::slice::from_ref(evidence), sources)
+                        && sources.iter().any(|source| {
+                            source.id == evidence.source_id
+                                && official_evidence_domain(&source.url, &model.api_url)
+                                && (evidence
+                                    .quote
+                                    .to_lowercase()
+                                    .contains(&model.model.to_lowercase())
+                                    || (!model.display_name.is_empty()
+                                        && evidence
+                                            .quote
+                                            .to_lowercase()
+                                            .contains(&model.display_name.to_lowercase())))
+                        })
+                }),
+            };
+            if !fits {
+                return Err(validation(&format!(
+                    "轻量选型未通过：{}。当前为意图识别或轻量任务；总参数超过14B不得入围。意图识别的参数未知型号也不得按轻量名称放行，其他轻量任务的API须有官方轻量依据。低激活MoE、Flash名称、通用能力强均不能代替入围依据。请重新选型，不保留不合适型号，不为数量、地区或兜底升档。",
+                    model.model
+                )));
+            }
+        }
+    }
+    Ok(())
+}
+
 fn research_queries(card: &RequirementCard) -> Vec<(&'static str, String)> {
     let field = |key: &str, limit: usize| {
         card.tasks
@@ -909,6 +1111,7 @@ fn research_queries(card: &RequirementCard) -> Vec<(&'static str, String)> {
     let difficulty = field("taskDifficulty", 5);
     let focus = field("taskFocus", 30);
     let compare_small = kind.contains("文生文") && difficulty != "难";
+    let lightweight = card.tasks.iter().any(lightweight_selection);
     let english_kind = card
         .tasks
         .iter()
@@ -947,6 +1150,42 @@ fn research_queries(card: &RequirementCard) -> Vec<(&'static str, String)> {
     } else {
         "国内及海外"
     };
+    if lightweight {
+        return vec![
+            (
+                "capabilities",
+                format!("{scope} {focus} {work} 主流厂商 通用指令模型 14B及以内 官方 非思考 {io}"),
+            ),
+            (
+                "capabilities",
+                format!(
+                    "{scope} {focus} 主流模型 14B及以内 官方 API 型号 {}",
+                    field("constraints", 35)
+                ),
+            ),
+            (
+                "cases",
+                format!("{scope} {focus} 难度{difficulty} {work} 小模型 官方案例 {features}"),
+            ),
+            (
+                "cost",
+                format!(
+                    "{scope} {focus} 小模型 官方价格 延迟 非思考 {}",
+                    field("cost", 35)
+                ),
+            ),
+            (
+                "capabilities",
+                if card.exclude_overseas {
+                    format!("国内 {focus} 轻量 API 官方 小模型")
+                } else {
+                    format!(
+                        "international {english_kind} small mini nano lightweight models official API pricing {focus}"
+                    )
+                },
+            ),
+        ];
+    }
     vec![
         (
             "capabilities",
@@ -1037,7 +1276,7 @@ async fn collect(
             "Arena 代码榜".into(),
             "https://arena.ai/leaderboard/chat/text/coding".into(),
         ));
-    } else if task_type.contains("文生文") {
+    } else if task_type.contains("文生文") && !card.tasks.iter().any(lightweight_selection) {
         initial.extend(
             REQUIRED
                 .iter()
@@ -1372,6 +1611,11 @@ fn recommendation_content(source: &Source, card: &RequirementCard) -> String {
                 "14b",
                 "8b",
                 "7b",
+                "4b",
+                "3b",
+                "1.5b",
+                "1b",
+                "0.5b",
                 "30b-a3b",
                 "a3b",
                 "small",
@@ -1521,6 +1765,7 @@ pub(super) async fn run(
         "targetUser":card.target_user.as_ref().map(|field| &field.value),
         "usageScenario":card.usage_scenario.as_ref().map(|field| &field.value),
         "excludeOverseas":card.exclude_overseas,
+        "selectionPolicy": {"lightweightFirst":card.tasks.iter().any(lightweight_selection),"initialMaxTotalParametersB":EASY_TASK_MAX_PARAMETERS_B,"rule":"易且仅优先速度/成本时：意图识别直接触发14B总参数上限，不依赖难度或优先级；其他易且仅优先速度/成本的文本任务也触发轻量策略。主流型号优先，不规定参数起步档位；意图识别时未知参数不能当作14B以内。不自动升档或凑数量、地区。此边界是初始筛选策略，不代表性能实测。"},
         "tasks":card.tasks.iter().map(|task| serde_json::json!({"id":task.id,"name":task.name,"modalityRequirements":task_modalities(task),"userConcerns":task.user_concerns,"fields":task.fields.iter().filter(|(_, field)| !field.value.is_empty()).map(|(key, field)| (key.clone(), field.value.clone())).collect::<BTreeMap<_,_>>()})).collect::<Vec<_>>()
     });
     let mut material = serde_json::json!({"requirements":requirements,"asOfDate":as_of_date,"researchedAtMs":now_ms(),"sources":recommendation_sources(&sources, card.exclude_overseas).iter().map(|source| serde_json::json!({"id":source.id,"area":source.area,"url":source.url,"status":source.status,"content":recommendation_content(source, card)})).collect::<Vec<_>>()});
@@ -1536,6 +1781,7 @@ pub(super) async fn run(
     let mut last_error = validation("入围名单未生成完整，请重试。");
     let mut retained = None;
     let mut supplement_region = None;
+    let mut repair_prompt = initial_prompt.clone();
     for attempt in 0..3 {
         progress(if supplement_region.is_some() {
             "正在补充另一地区的适合模型…"
@@ -1553,7 +1799,7 @@ pub(super) async fn run(
             } else if supplement_region.is_some() {
                 "用户未限制模型地区。按missingRegion补充3个适合本任务的不同型号：china是国内，overseas是海外。只返回新增候选，不重复existingCandidates，不重做已有名单。主力侧重性价比，兜底侧重质量；apiUrl使用sources中该模型官方API文档或接入页的真实地址，不猜地址。若新增型号比已有主力或兜底更合适，role标main或fallback；否则role=candidate，不能为凑地区强改推荐。分别用mainRank、fallbackRank标注新增型号在该角色的第一推荐1、第二推荐2或未推荐0，主力和兜底分别比较。结合requirements和sources，给出模型名称、origin及35字内的一句适配理由，keywords提取理由原文中1～3个关键词，独立给mainStars和fallbackStars各1～3星，每档数量不限，并用mainReason和fallbackReason分别解释星级。逐项有可核验引用则附上，每项用kind标official_case、official_docs、benchmark或reference，label简述当前任务的具体用法，不能把新闻或目录冒充案例；没有则basis=inference、evidence=[]，不编造版本和事实。格式为 {\"groups\":[{\"taskId\":\"原任务ID\",\"candidates\":[{\"model\":\"实际型号或官方名称\",\"origin\":\"china或overseas\",\"reason\":\"一句适配理由\",\"basis\":\"inference\",\"evidence\":[]}]}]}。"
             } else {
-                "你是JSON格式修复器。只整理previousResult中已经给出的模型与理由，不重新选型、不搜索、不分析、不编造补充型号。返回 {\"groups\":[{\"taskId\":\"给定任务ID\",\"candidates\":[{\"model\":\"原模型名称或ID\",\"origin\":\"china或overseas\",\"reason\":\"原推荐理由\",\"basis\":\"inference\",\"evidence\":[]}],\"suitableModels\":[]}]}。保留原有apiUrl、keywords、mainRank、fallbackRank、mainStars、fallbackStars、mainReason、fallbackReason、evidence的kind及label和明确的地区限制。"
+                &repair_prompt
             },
             "调研结论",
             &progress,
@@ -1583,6 +1829,7 @@ pub(super) async fn run(
             }
             discard_unverified(&mut report, &sources);
             validate_report(&report, card, &sources)?;
+            validate_resource_fit(&report, card, &sources)?;
             Ok(report)
         });
         match checked {
@@ -1592,6 +1839,7 @@ pub(super) async fn run(
                 }
                 if !adding
                     && supplement_region.is_none()
+                    && !card.tasks.iter().any(lightweight_selection)
                     && let Some(region) = missing_region(&report, card.exclude_overseas)
                 {
                     material["existingCandidates"] =
@@ -1606,8 +1854,12 @@ pub(super) async fn run(
             Err(error) => {
                 last_error = error;
                 if attempt == 0 {
-                    material = serde_json::json!({"previousResult":output.text,"taskIds":card.tasks.iter().map(|task| &task.id).collect::<Vec<_>>(),"excludeOverseas":card.exclude_overseas,"correction":last_error.message});
-                    progress("正在整理模型已返回的推荐内容…");
+                    material["previousResult"] = serde_json::json!(output.text);
+                    material["correction"] = serde_json::json!(last_error.message);
+                    repair_prompt = format!(
+                        "{initial_prompt}\n上次结果未通过校验，请按correction纠正；选型不合适时必须重新选择型号，格式问题只修格式。requirements、selectionPolicy、sources及排除名单仍然有效。不要照抄不合适的旧名单。\n"
+                    );
+                    progress("正在纠正未通过校验的模型选型…");
                 } else {
                     return retained.map(|report| (report, sources)).ok_or(last_error);
                 }
@@ -1638,6 +1890,246 @@ pub(super) fn status(report: &Report, sources: &[Source]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn easy_fast_card() -> RequirementCard {
+        let mut card = super::super::tests::card();
+        for (key, value) in [
+            ("taskType", "文生文"),
+            ("taskDifficulty", "易"),
+            ("taskFocus", "意图分类、信息抽取"),
+            ("priorities", "速度、成本"),
+        ] {
+            card.tasks[0].fields.get_mut(key).unwrap().value = value.into();
+        }
+        card
+    }
+
+    #[test]
+    fn easy_fast_selection_rejects_large_moe_and_flash_without_lightweight_evidence() {
+        let card = easy_fast_card();
+        let report = |name: &str| {
+            parse_report(
+                &serde_json::json!({"candidates":[{"model":name,"reason":"意图识别"}]}).to_string(),
+                &card,
+            )
+            .unwrap()
+        };
+        for name in [
+            "Qwen3.5-35B-A3B",
+            "Qwen3.5-122B-A10B",
+            "DeepSeek-V4.1-Flash-1017",
+            "Model-1T",
+            "Model-15B",
+            "Xing4.0-29B-Intent",
+            "Model-A3B",
+        ] {
+            assert!(
+                validate_resource_fit(&report(name), &card, &[]).is_err(),
+                "{name}"
+            );
+        }
+        for name in [
+            "Model-0.5B",
+            "Model-1.5B",
+            "Model-4B",
+            "Model-8B",
+            "Model-9B",
+            "Model-14B",
+            "Model-14.1B",
+            "Model-35B-A3B",
+        ] {
+            let mut candidate = report(name);
+            candidate.groups[0].candidates[0].api_url = "https://vendor.test/api".into();
+            let sources = vec![Source {
+                id: "official".into(),
+                area: "capabilities".into(),
+                title: "catalogue".into(),
+                url: "https://vendor.test/models".into(),
+                status: "read".into(),
+                checked_at_ms: 1,
+                error: String::new(),
+                text: name.into(),
+            }];
+            assert_eq!(
+                validate_resource_fit(&candidate, &card, &sources).is_ok(),
+                named_parameters_b(name).unwrap() <= 14.0,
+                "{name}"
+            );
+            assert!(
+                validate_resource_fit(&candidate, &card, &[]).is_err(),
+                "unverified {name}"
+            );
+        }
+        assert_eq!(named_parameters_b("Qwen3.5-35B-A3B"), Some(35.0));
+        assert_eq!(named_parameters_b("API-Flash-1017"), None);
+        let mut hard = card.clone();
+        hard.tasks[0].fields.get_mut("taskFocus").unwrap().value = "文本摘要".into();
+        hard.tasks[0]
+            .fields
+            .get_mut("taskDifficulty")
+            .unwrap()
+            .value = "难".into();
+        assert!(validate_resource_fit(&report("Model-35B"), &hard, &[]).is_ok());
+        for priorities in ["", "准确性", "准确性、速度、成本"] {
+            hard.tasks[0]
+                .fields
+                .get_mut("taskDifficulty")
+                .unwrap()
+                .value = "易".into();
+            hard.tasks[0].fields.get_mut("priorities").unwrap().value = priorities.into();
+            assert!(!lightweight_selection(&hard.tasks[0]));
+        }
+        let extra = report("Model-122B");
+        assert!(validate_resource_fit(&extra, &card, &[]).is_err());
+    }
+
+    #[test]
+    fn intent_policy_does_not_depend_on_difficulty_priorities_or_exact_task_title() {
+        let mut card = easy_fast_card();
+        card.tasks[0].name = "教师备课意图识别".into();
+        card.tasks[0]
+            .fields
+            .get_mut("taskFocus")
+            .unwrap()
+            .value
+            .clear();
+        for difficulty in ["", "易", "中", "难"] {
+            for priorities in ["", "准确性", "速度", "成本", "准确性、速度、成本"] {
+                card.tasks[0]
+                    .fields
+                    .get_mut("taskDifficulty")
+                    .unwrap()
+                    .value = difficulty.into();
+                card.tasks[0].fields.get_mut("priorities").unwrap().value = priorities.into();
+                assert!(lightweight_selection(&card.tasks[0]));
+            }
+        }
+        card.tasks[0].name = "需求分类".into();
+        card.tasks[0].fields.get_mut("taskFocus").unwrap().value =
+            "Intent classification、字段抽取".into();
+        assert!(lightweight_selection(&card.tasks[0]));
+        card.tasks[0]
+            .fields
+            .get_mut("taskFocus")
+            .unwrap()
+            .value
+            .clear();
+        card.tasks[0].fields.get_mut("businessGoal").unwrap().value =
+            "识别教师备课意图分类与缺失字段".into();
+        assert!(lightweight_selection(&card.tasks[0]));
+        card.tasks[0].name = "互动课件生成".into();
+        card.tasks[0].fields.get_mut("taskType").unwrap().value = "代码生成".into();
+        card.project_context = Some(RequirementField {
+            value: "上游还有意图识别".into(),
+            source: "user".into(),
+            evidence: String::new(),
+        });
+        assert!(!lightweight_selection(&card.tasks[0]));
+    }
+
+    #[test]
+    fn intent_policy_rejects_unknown_scale_even_if_the_api_is_described_as_lightweight() {
+        let mut card = easy_fast_card();
+        card.tasks[0].name = "意图识别".into();
+        let sources = vec![Source { id: "official".into(), area: "capabilities".into(), title: "docs".into(), url: "https://vendor.test/models".into(), status: "read".into(), checked_at_ms: 1, error: String::new(), text: "Vendor Flash is a lightweight model. Vendor-14B is available. Vendor-35B-A3B is available.".into() }];
+        for (name, label, allowed) in [
+            ("Vendor Flash", "", false),
+            ("Vendor Flash", "Invented-7B", false),
+            ("Vendor-14B", "", true),
+            ("Vendor-35B-A3B", "Vendor-7B", false),
+        ] {
+            let report = parse_report(&serde_json::json!({"candidates":[{"model":name,"displayName":label,"apiUrl":"https://vendor.test/api","reason":"意图分类","evidence":[{"sourceId":"official","quote":"Vendor Flash is a lightweight model."}]}]}).to_string(), &card).unwrap();
+            assert_eq!(
+                validate_resource_fit(&report, &card, &sources).is_ok(),
+                allowed,
+                "{name} {label}"
+            );
+        }
+    }
+
+    #[test]
+    fn outdated_intent_reports_are_not_reused_or_left_selected() {
+        let mut card = easy_fast_card();
+        card.tasks[0].name = "意图识别".into();
+        let report = parse_report(
+            r#"{"candidates":[{"model":"Vendor-35B","reason":"旧推荐"}]}"#,
+            &card,
+        )
+        .unwrap();
+        let task_id = card.tasks[0].id.clone();
+        let mut session = SelectionSession {
+            draft: Some(card),
+            ..Default::default()
+        };
+        let result: ResearchResult = serde_json::from_value(serde_json::json!({"status":"complete","revision":0,"researchedAtMs":1,"asOfDate":"2026-10-29","sources":[],"report":report,"error":""})).unwrap();
+        session.task_runs.insert(
+            task_id.clone(),
+            TaskRun {
+                research: Some(result),
+                selected_model: Some("Vendor-35B".into()),
+                fallback_model: Some("Vendor-122B".into()),
+            },
+        );
+        invalidate_outdated_research(&mut session);
+        let run = &session.task_runs[&task_id];
+        assert!(run.selected_model.is_none() && run.fallback_model.is_none());
+        let result = run.research.as_ref().unwrap();
+        assert!(result.report.is_none());
+        assert_eq!(result.status, "failed");
+        assert!(session.draft.is_some());
+    }
+
+    #[test]
+    fn opaque_lightweight_api_requires_official_model_specific_retrieved_evidence() {
+        let mut card = easy_fast_card();
+        card.tasks[0].fields.get_mut("taskFocus").unwrap().value = "文本摘要".into();
+        let mut report = parse_report(&serde_json::json!({"candidates":[{"model":"Vendor Mini", "reason":"意图分类", "apiUrl":"https://vendor.test/api", "evidence":[{"sourceId":"official", "quote":"Vendor Mini is a lightweight model for classification."}]}]}).to_string(), &card).unwrap();
+        let mut sources = vec![Source {
+            id: "official".into(),
+            area: "capabilities".into(),
+            title: "docs".into(),
+            url: "https://vendor.test/models".into(),
+            status: "read".into(),
+            checked_at_ms: 1,
+            error: String::new(),
+            text: "Vendor Mini is a lightweight model for classification.".into(),
+        }];
+        assert!(validate_resource_fit(&report, &card, &sources).is_ok());
+        sources[0].url = "https://third-party.test/models".into();
+        assert!(validate_resource_fit(&report, &card, &sources).is_err());
+        sources[0].url = "https://vendor.test/models".into();
+        sources[0].status = "failed".into();
+        assert!(validate_resource_fit(&report, &card, &sources).is_err());
+        sources[0].status = "read".into();
+        report.groups[0].candidates[0].model = "Vendor Flash".into();
+        assert!(validate_resource_fit(&report, &card, &sources).is_err());
+    }
+
+    #[test]
+    fn easy_fast_search_compares_mainstream_models_up_to_14b_without_a_starting_size() {
+        let mut card = easy_fast_card();
+        card.exclude_overseas = true;
+        card.tasks[0].fields.get_mut("constraints").unwrap().value = "本地部署".into();
+        let queries = research_queries(&card)
+            .into_iter()
+            .map(|(_, query)| query)
+            .collect::<Vec<_>>()
+            .join("\n");
+        for term in ["14B及以内", "主流", "意图分类", "本地部署", "价格", "延迟"] {
+            assert!(queries.contains(term), "{term}");
+        }
+        for term in [
+            "0.5B",
+            "1.5B",
+            "30B",
+            "A3B",
+            "海外",
+            "international",
+            "专项评测",
+        ] {
+            assert!(!queries.contains(term), "{term}");
+        }
+    }
 
     #[test]
     fn labels_real_official_cases_but_never_relabels_third_party_news_as_official() {
@@ -1700,7 +2192,7 @@ mod tests {
             "信息抽取",
             "难度易",
             "14B",
-            "A3B",
+            "主流",
             "非思考",
             "small mini nano",
         ] {

@@ -194,12 +194,31 @@ fn now_ms() -> u64 {
 
 #[derive(Clone, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase")]
+struct IntentOption {
+    id: String,
+    name: String,
+    work: String,
+}
+
+#[derive(Clone, Deserialize, Serialize)]
+#[serde(untagged)]
+enum IntentSelection {
+    Record {
+        options: Vec<IntentOption>,
+        #[serde(rename = "selectedTaskId")]
+        selected_task_id: String,
+    },
+    Legacy(String),
+}
+
+#[derive(Clone, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
 pub(crate) struct SelectionSession {
     id: String,
     revision: u64,
     description: String,
     running: bool,
-    intent_selections: Vec<String>,
+    intent_selections: Vec<IntentSelection>,
     draft: Option<RequirementCard>,
     confirmed: Option<ConfirmedCard>,
     invocation: Option<Invocation>,
@@ -791,6 +810,7 @@ fn select_task(
     session_id: &str,
     revision: u64,
     task_id: &str,
+    work_descriptions: &BTreeMap<String, String>,
 ) -> AppResult<SelectionSession> {
     version_check(session, session_id, revision)?;
     if session.running || session.confirmed.is_some() {
@@ -806,6 +826,56 @@ fn select_task(
         .iter()
         .position(|task| task.id == task_id)
         .ok_or_else(|| validation("该环节不存在，请重新选择。"))?;
+    for (id, work) in work_descriptions {
+        let task_index = card
+            .tasks
+            .iter()
+            .position(|task| &task.id == id)
+            .ok_or_else(|| validation("工作说明对应的环节已变化，请重新选择。"))?;
+        if work.chars().count() > 4000 || (id == task_id && work.trim().is_empty()) {
+            return Err(validation("请填写所选环节的工作说明，最多4,000字。"));
+        }
+        card.tasks[task_index].fields.insert(
+            "businessGoal".into(),
+            RequirementField {
+                value: work.clone(),
+                source: if work.trim().is_empty() {
+                    "missing"
+                } else {
+                    "user"
+                }
+                .into(),
+                evidence: String::new(),
+            },
+        );
+        card.suggestions
+            .retain(|item| !(item.task_index == task_index && item.field == "businessGoal"));
+    }
+    let record = IntentSelection::Record {
+        selected_task_id: task_id.to_string(),
+        options: card
+            .tasks
+            .iter()
+            .enumerate()
+            .map(|(task_index, task)| {
+                let goal = &task.fields["businessGoal"];
+                let work = if !goal.value.trim().is_empty() || goal.source == "user" {
+                    goal.value.clone()
+                } else {
+                    card.suggestions
+                        .iter()
+                        .find(|item| item.task_index == task_index && item.field == "businessGoal")
+                        .map(|item| item.value.clone())
+                        .unwrap_or_default()
+                };
+                IntentOption {
+                    id: task.id.clone(),
+                    name: task.name.clone(),
+                    work,
+                }
+            })
+            .collect(),
+    };
     card.tasks = vec![card.tasks.remove(index)];
     card.suggestions = card
         .suggestions
@@ -818,7 +888,7 @@ fn select_task(
         .collect();
     validate_card(&card, false)?;
     session.revision += 1;
-    session.intent_selections.push(card.tasks[0].name.clone());
+    session.intent_selections.push(record);
     session.draft = Some(card);
     session.progress = None;
     session.task_runs.clear();
@@ -832,10 +902,17 @@ pub(crate) fn selection_select_task(
     session_id: String,
     revision: u64,
     task_id: String,
+    work_descriptions: Option<BTreeMap<String, String>>,
     state: State<'_, SelectionState>,
 ) -> AppResult<SelectionSession> {
     let mut session = state.0.lock().map_err(|_| lock_error())?;
-    select_task(&mut session, &session_id, revision, &task_id)?;
+    select_task(
+        &mut session,
+        &session_id,
+        revision,
+        &task_id,
+        &work_descriptions.unwrap_or_default(),
+    )?;
     state.checkpoint(&mut session, true);
     Ok(session.clone())
 }
@@ -1480,6 +1557,7 @@ pub(crate) async fn research_command(
                 .and_then(|run| run.research.as_ref())
                 .is_some_and(|result| {
                     result.revision == revision
+                        && result.resource_policy_version == research::RESOURCE_POLICY_VERSION
                         && result.as_of_date == as_of_date
                         && ["complete", "partial"].contains(&result.status.as_str())
                 })
@@ -1520,6 +1598,7 @@ pub(crate) async fn research_command(
                 rating_attempted: false,
                 rating_error: String::new(),
                 rating_version: 1,
+                resource_policy_version: research::RESOURCE_POLICY_VERSION,
             });
         }
         state.checkpoint(&mut session, false);
@@ -1900,6 +1979,16 @@ mod tests {
                 accepted: false,
             });
         }
+        for task_index in 0..2 {
+            pending.suggestions.push(Suggestion {
+                id: format!("work-{task_index}"),
+                task_index,
+                field: "businessGoal".into(),
+                value: format!("工作说明 {task_index}"),
+                reason: "建议".into(),
+                accepted: false,
+            });
+        }
         validate_card(&pending, true).unwrap();
         let mut session = SelectionSession {
             draft: Some(pending.clone()),
@@ -1920,16 +2009,40 @@ mod tests {
         );
         assert_eq!(session.revision, 0);
         assert!(session.confirmed.is_none());
-        let chosen = select_task(&mut session, &id, 0, "second").unwrap();
+        for edits in [
+            BTreeMap::from([("second".into(), String::new())]),
+            BTreeMap::from([("missing".into(), "说明".into())]),
+            BTreeMap::from([("second".into(), "字".repeat(4001))]),
+        ] {
+            assert!(select_task(&mut session, &id, 0, "second", &edits).is_err());
+            assert_eq!(session.revision, 0);
+            assert_eq!(session.draft.as_ref().unwrap().tasks.len(), 2);
+        }
+        let edited_work = "仅提取会议结论，不生成摘要";
+        let chosen = select_task(
+            &mut session,
+            &id,
+            0,
+            "second",
+            &BTreeMap::from([("second".into(), edited_work.into())]),
+        )
+        .unwrap();
         let selected = chosen.draft.unwrap();
         assert_eq!(selected.tasks.len(), 1);
         assert_eq!(selected.tasks[0].id, "second");
         assert_eq!(selected.project_context.unwrap().value, "会议录音");
         assert_eq!(selected.suggestions.len(), 1);
+        assert_eq!(selected.tasks[0].fields["businessGoal"].value, edited_work);
+        assert_eq!(selected.tasks[0].fields["businessGoal"].source, "user");
         assert_eq!(selected.suggestions[0].id, "suggestion-1");
         assert_eq!(selected.suggestions[0].task_index, 0);
         assert_eq!(session.revision, 1);
-        assert_eq!(session.intent_selections, vec!["整理摘要"]);
+        let saved_choices = serde_json::to_value(&session.intent_selections).unwrap();
+        assert_eq!(saved_choices[0]["selectedTaskId"], "second");
+        assert_eq!(saved_choices[0]["options"].as_array().unwrap().len(), 2);
+        assert_eq!(saved_choices[0]["options"][1]["name"], "整理摘要");
+        assert_eq!(saved_choices[0]["options"][0]["work"], "工作说明 0");
+        assert_eq!(saved_choices[0]["options"][1]["work"], edited_work);
         assert!(session.task_runs.is_empty());
         assert!(session.confirmed.is_none());
         confirm(
@@ -1944,7 +2057,24 @@ mod tests {
         .unwrap();
         assert!(task_card(&session, "task").is_err());
         assert_eq!(task_card(&session, "second").unwrap().tasks.len(), 1);
-        assert_eq!(session.intent_selections, vec!["整理摘要"]);
+        assert_eq!(
+            task_card(&session, "second").unwrap().tasks[0].fields["businessGoal"].value,
+            edited_work
+        );
+        assert_eq!(
+            serde_json::to_value(&session.intent_selections).unwrap(),
+            saved_choices
+        );
+        let restored: SelectionSession =
+            serde_json::from_value(serde_json::to_value(&session).unwrap()).unwrap();
+        assert_eq!(
+            serde_json::to_value(restored.intent_selections).unwrap(),
+            saved_choices
+        );
+        assert!(matches!(
+            serde_json::from_value::<IntentSelection>(serde_json::json!("整理摘要")).unwrap(),
+            IntentSelection::Legacy(_)
+        ));
     }
 
     #[test]
@@ -1965,15 +2095,24 @@ mod tests {
             (&id[..], 2, "unknown"),
         ] {
             let before = serde_json::to_value(&session).unwrap();
-            assert!(select_task(&mut session, session_id, revision, task_id).is_err());
+            assert!(
+                select_task(
+                    &mut session,
+                    session_id,
+                    revision,
+                    task_id,
+                    &BTreeMap::new()
+                )
+                .is_err()
+            );
             assert_eq!(serde_json::to_value(&session).unwrap(), before);
         }
         session.running = true;
-        assert!(select_task(&mut session, &id, 2, "task").is_err());
+        assert!(select_task(&mut session, &id, 2, "task", &BTreeMap::new()).is_err());
         assert_eq!(session.draft.as_ref().unwrap().tasks.len(), 2);
         session.running = false;
-        select_task(&mut session, &id, 2, "task").unwrap();
-        assert!(select_task(&mut session, &id, 3, "second").is_err());
+        select_task(&mut session, &id, 2, "task", &BTreeMap::new()).unwrap();
+        assert!(select_task(&mut session, &id, 3, "second", &BTreeMap::new()).is_err());
         assert_eq!(session.draft.as_ref().unwrap().tasks[0].id, "task");
     }
 
@@ -2206,6 +2345,7 @@ mod tests {
                     rating_attempted: false,
                     rating_error: String::new(),
                     rating_version: 1,
+                    resource_policy_version: research::RESOURCE_POLICY_VERSION,
                 }),
             },
         );
