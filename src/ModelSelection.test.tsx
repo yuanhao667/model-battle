@@ -13,7 +13,7 @@ vi.mock("@tauri-apps/api/event", () => ({ listen: vi.fn().mockResolvedValue(() =
 
 const assistant: AssistantSettings = { hasCredential: true, modelId: DEFAULT_ASSISTANT_MODEL };
 const connections = [{ id: "c", displayName: "已有连接", hasCredential: true, providerKind: "siliconflow", baseUrl: "https://example.com/v1", models: [] }];
-const initial = (): SelectionSession => ({ id: "session", revision: 0, description: "", running: false, draft: null, confirmed: null, invocation: null });
+const initial = (): SelectionSession => ({ id: "session", revision: 0, description: "", running: false, draft: null, confirmed: null, invocation: null, intentConfirmationRequired: false });
 const card = (): RequirementCard => {
   const task = emptyTask();
   task.name = "会议转写";
@@ -122,7 +122,12 @@ describe("model selection", () => {
   it("sends a chat message, receives a prefilled card, and keeps the composer available", async () => {
     const user = userEvent.setup();
     const draft = card();
-    invoke.mockImplementation((command: string) => Promise.resolve(command === "selection_extract" ? { ...initial(), revision: 1, description: draft.description, draft } : initial()));
+    let current = initial();
+    invoke.mockImplementation((command: string) => {
+      if (command === "selection_extract") current = { ...initial(), revision: 1, description: draft.description, draft, intentConfirmationRequired: true };
+      if (command === "selection_select_task") current = { ...current, revision: 2, intentConfirmationRequired: false, intentSelections: [{ options: intentOptions(draft), selectedTaskId: draft.tasks[0].id }] };
+      return Promise.resolve(current);
+    });
     mount();
     const input = screen.getByRole("textbox", { name: "你希望 AI 完成什么工作？" });
     await waitFor(() => expect(input).toBeEnabled());
@@ -132,6 +137,11 @@ describe("model selection", () => {
     expect(input.closest(".selection-page")).toHaveClass("is-landing");
     await user.type(input, draft.description);
     await user.click(screen.getByRole("button", { name: "发送需求" }));
+    const choice = await screen.findByRole("region", { name: "选择选型环节" });
+    expect(screen.queryByRole("group", { name: "需求确认卡片" })).not.toBeInTheDocument();
+    expect(invoke.mock.calls.filter(([command]) => command === "selection_confirm" || command === "research_command")).toHaveLength(0);
+    await user.click(within(choice).getByRole("radio", { name: "会议转写" }));
+    await user.click(within(choice).getByRole("button", { name: "确认选择" }));
     expect(await screen.findByRole("group", { name: "需求确认卡片" })).toBeVisible();
     const firstCard = screen.getByRole("article", { name: "任务 1 需求确认卡片" });
     expect(firstCard).toHaveClass("selection-card");
@@ -695,6 +705,10 @@ describe("model selection", () => {
     expect(within(choice).getByRole("textbox", { name: "会议转写的工作说明" })).toHaveValue("将会议录音转成文字");
     const explanation = within(choice).getByRole("textbox", { name: "课时编排的工作说明" });
     expect(explanation).toHaveValue("安排课程环节");
+    expect(explanation).toHaveAttribute("readonly");
+    await user.click(explanation);
+    expect(explanation).toHaveFocus();
+    expect(explanation).not.toHaveAttribute("readonly");
     expect(within(choice).queryByDisplayValue("陈旧的工作说明")).not.toBeInTheDocument();
     await user.clear(explanation);
     await user.type(explanation, "只分配每课时主题，不安排教学活动");
@@ -721,12 +735,58 @@ describe("model selection", () => {
     expect(invoke.mock.calls.filter(([command]) => command === "selection_extract" || command === "research_command")).toHaveLength(0);
   });
 
+  it("edits the explanation on click, cancels with Escape, and saves with Enter or blur", async () => {
+    const user = userEvent.setup();
+    const draft = card(); draft.tasks.push({ ...emptyTask(), name: "课时编排" });
+    invoke.mockResolvedValue({ ...initial(), draft });
+    mount();
+    const field = await screen.findByRole("textbox", { name: "会议转写的工作说明" });
+    expect(field).toHaveAttribute("readonly");
+    expect(screen.queryByRole("button", { name: "编辑会议转写的工作说明" })).not.toBeInTheDocument();
+    await user.click(field);
+    expect(field).not.toHaveAttribute("readonly");
+    await user.clear(field);
+    await user.type(field, "这次不保存");
+    await user.keyboard("{Escape}");
+    expect(field).toHaveValue("将会议录音转成文字");
+    expect(field).toHaveAttribute("readonly");
+    await user.click(field);
+    await user.clear(field);
+    await user.type(field, "只保留会议结论");
+    await user.keyboard("{Enter}");
+    expect(field).toHaveValue("只保留会议结论");
+    expect(field).toHaveAttribute("readonly");
+    await user.click(field);
+    await user.keyboard("{End}{Shift>}{Enter}{/Shift}补充待办事项");
+    expect(field).not.toHaveAttribute("readonly");
+    await user.click(screen.getByRole("radio", { name: "会议转写" }));
+    expect(field).toHaveValue("只保留会议结论\n补充待办事项");
+    expect(field).toHaveAttribute("readonly");
+    expect(invoke.mock.calls.filter(([command]) => command === "selection_extract" || command === "selection_select_task" || command === "research_command")).toHaveLength(0);
+  });
+
+  it.each(["new", "legacy"])("keeps a single %s candidate at intent confirmation even when a saved view contains a card", async (version) => {
+    const draft = card();
+    const current: SelectionSession = { ...initial(), draft, intentConfirmationRequired: true };
+    if (version === "legacy") delete current.intentConfirmationRequired;
+    invoke.mockImplementation((command: string) => Promise.resolve(command === "selection_conversations" ? {
+      conversations: [], view: { card: draft, description: "尚未发送的补充", messages: [draft.description], editing: true },
+    } : current));
+    mount();
+    const choice = await screen.findByRole("region", { name: "选择选型环节" });
+    expect(within(choice).getByRole("radio", { name: "会议转写" })).toBeVisible();
+    expect(within(choice).getByRole("textbox", { name: "会议转写的工作说明" })).toHaveValue("将会议录音转成文字");
+    expect(screen.queryByRole("group", { name: "需求确认卡片" })).not.toBeInTheDocument();
+    expect(screen.getByRole("textbox", { name: "你希望 AI 完成什么工作？" })).toHaveValue("尚未发送的补充");
+  });
+
   it("retains pending choices after a selection error", async () => {
     const user = userEvent.setup();
     const draft = card(); draft.tasks.push({ ...emptyTask(), name: "HTML 生成" });
     invoke.mockImplementation((command: string) => command === "selection_select_task" ? Promise.reject({ message: "选择暂时失败" }) : Promise.resolve({ ...initial(), draft }));
     mount();
-    await user.type(await screen.findByRole("textbox", { name: "HTML 生成的工作说明" }), "生成可运行的HTML页面");
+    await user.click(await screen.findByRole("textbox", { name: "HTML 生成的工作说明" }));
+    await user.type(screen.getByRole("textbox", { name: "HTML 生成的工作说明" }), "生成可运行的HTML页面");
     await user.click(screen.getByRole("radio", { name: "HTML 生成" }));
     await user.click(screen.getByRole("button", { name: "确认选择" }));
     expect(await screen.findByText("选择暂时失败")).toBeVisible();
@@ -795,6 +855,7 @@ describe("model selection", () => {
     await user.click(screen.getByRole("button", { name: "发送需求" }));
     expect(await screen.findByText("更新失败")).toBeVisible();
     const sent = invoke.mock.calls.find(([command]) => command === "selection_extract")![1].input;
+    expect(sent.currentMessage).toBe("只需要处理中文");
     expect(sent.description).toContain("最新补充：只需要处理中文");
     expect(sent.description).toContain("当前用户及使用场景：运营；会议后整理");
     expect(sent.description).toContain("当前额外业务标签（以此列表为准，删除项不要恢复）：结构化字段输出");
@@ -1034,11 +1095,11 @@ describe("model selection", () => {
     expect(invoke.mock.calls.filter(([command]) => ["selection_reset", "selection_extract", "research_command"].includes(command))).toHaveLength(0);
     const history = screen.getByRole("navigation", { name: "历史选型" });
     expect(within(history).getAllByRole("button")).toHaveLength(6);
-    await user.click(within(history).getByRole("button", { name: "会议转写" }));
+    await user.click(within(history).getByRole("button", { name: /^会议转写 / }));
     expect(await screen.findByText("old-model")).toBeVisible();
     expect(input).toHaveValue("保留这段未发送的补充");
     expect(screen.getByRole("group", { name: "需求确认卡片" })).toBeVisible();
-    expect(within(history).getByRole("button", { name: "会议转写" })).toHaveAttribute("aria-current", "page");
+    expect(within(history).getByRole("button", { name: /^会议转写 / })).toHaveAttribute("aria-current", "page");
   });
 
   it("restores a locally saved editable card and input draft when the app is reopened", async () => {
@@ -1052,6 +1113,27 @@ describe("model selection", () => {
     expect(await screen.findByRole("textbox", { name: "任务 1：输入" })).toHaveValue("尚未提交的新录音要求");
     expect(screen.getByRole("textbox", { name: "你希望 AI 完成什么工作？" })).toHaveValue("尚未发送的文字");
     await waitFor(() => expect(invoke).toHaveBeenCalledWith("selection_conversation_save", expect.objectContaining({ sessionId: "session", view: expect.objectContaining({ description: "尚未发送的文字" }) })));
+  });
+
+  it("keeps distinct conversations and displays every update date and time on a second line", async () => {
+    const items = [
+      { id: "older", title: "课时编排", updatedAtMs: Date.parse("2026-10-22T07:14:39Z"), pinned: true },
+      { id: "newer", title: "课时编排", updatedAtMs: Date.parse("2026-10-29T08:09:13Z"), pinned: false },
+      { id: "other", title: "互动课件生成", updatedAtMs: Date.parse("2026-10-29T08:03:25Z"), pinned: false },
+    ];
+    invoke.mockImplementation((command: string) => Promise.resolve(command === "selection_conversations" ? { conversations: items, view: null } : initial()));
+    mount();
+    const history = await screen.findByRole("navigation", { name: "历史选型" });
+    await waitFor(() => expect(history.children).toHaveLength(3));
+    const older = within(history).getByText("2026/10/22 15:14:39");
+    const newer = within(history).getByText("2026/10/29 16:09:13");
+    expect(older.tagName).toBe("TIME");
+    expect(older.previousElementSibling).toHaveTextContent("课时编排");
+    expect(newer.previousElementSibling).toHaveTextContent("课时编排");
+    expect(older).toHaveAttribute("title", "最后更新：2026/10/22 15:14:39");
+    expect(history.querySelectorAll("time")).toHaveLength(3);
+    expect(within(history).getByText("2026/10/29 16:03:25").previousElementSibling).toHaveTextContent("互动课件生成");
+    expect(within(history).getByRole("button", { name: /^互动课件生成 / })).toBeVisible();
   });
 
   it("pins, unpins and deletes conversations without triggering a conversation-open click", async () => {
@@ -1079,6 +1161,8 @@ describe("model selection", () => {
     expect(await screen.findByRole("button", { name: "取消置顶 会议转写" })).toHaveAttribute("aria-pressed", "true");
     const history = screen.getByRole("navigation", { name: "历史选型" });
     expect(history.firstElementChild).toHaveTextContent("会议转写");
+    expect(within(history).getAllByRole("button", { name: /^会议转写 / })).toHaveLength(1);
+    expect(history.children).toHaveLength(2);
     await user.click(screen.getByRole("button", { name: "取消置顶 会议转写" }));
     expect(await screen.findByRole("button", { name: "置顶对话 会议转写" })).toHaveAttribute("aria-pressed", "false");
     await user.click(screen.getByRole("button", { name: "删除对话 会议转写" }));

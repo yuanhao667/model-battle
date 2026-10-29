@@ -4,10 +4,52 @@ import SelectionResearch from "./SelectionResearch";
 import SelectionDriverSettings from "./SelectionDriverSettings";
 import {
   ASSISTANT_CONTEXT_TOKENS, ASSISTANT_MODEL_LABEL, DEFAULT_ASSISTANT_MODEL, AssistantSettings, ConversationSummary, ConversationView, SelectionWorkspace, emptyTask, FieldKey, RequirementCard,
-  prefillSuggestions, priorityOptions, selectedPriorities, priorityLabel, requirementFields, selectionContextFields, selectionApi, selectionError, SelectionSession, taskTypes, userScenarioValue, IntentOption, intentOptions,
+  prefillSuggestions, priorityOptions, selectedPriorities, priorityLabel, requirementFields, selectionContextFields, selectionApi, selectionError, SelectionSession, taskTypes, userScenarioValue, IntentOption, intentOptions, needsIntentConfirmation,
 } from "./selection";
 
 type EditableConcern = { label: string; selected: boolean };
+
+function IntentWork({ option, busy, onChange }: { option: IntentOption; busy: boolean; onChange?: (id: string, work: string) => void }) {
+  const [editing, setEditing] = useState(false);
+  const [draft, setDraft] = useState(option.work);
+  const activeEdit = useRef(false);
+  const fieldRef = useRef<HTMLTextAreaElement>(null);
+  useEffect(() => {
+    if (editing) fieldRef.current?.focus({ preventScroll: true });
+    resizeContextField(fieldRef.current);
+  }, [editing, option.work]);
+  function start() {
+    if (activeEdit.current || busy) return;
+    setDraft(option.work);
+    activeEdit.current = true;
+    setEditing(true);
+  }
+  function finish(value: string, save: boolean) {
+    if (!activeEdit.current) return;
+    activeEdit.current = false;
+    if (save) onChange?.(option.id, value);
+    setEditing(false);
+  }
+  return <div className={`selection-intent-work-row${editing ? " is-editing" : ""}`}>
+    <textarea className="selection-intent-work" aria-label={`${option.name}的工作说明`} rows={1} maxLength={4000} value={editing ? draft : option.work} readOnly={!editing} tabIndex={0} disabled={busy} placeholder="描述希望 AI 处理什么、做什么、输出什么" ref={fieldRef}
+      onClick={start}
+      onChange={(event) => { setDraft(event.target.value); resizeContextField(event.target); }}
+      onBlur={(event) => finish(event.currentTarget.value, true)}
+      onKeyDown={(event) => {
+        if (event.nativeEvent.isComposing) return;
+        if (!editing) {
+          if (event.key === "Enter") { event.preventDefault(); start(); }
+          return;
+        }
+        if (event.key === "Escape" || (event.key === "Enter" && !event.shiftKey)) {
+          event.preventDefault();
+          finish(event.currentTarget.value, event.key === "Enter");
+          event.currentTarget.blur();
+        }
+      }} />
+
+  </div>;
+}
 
 function IntentChoices({ options, selectedId, prefix, recorded = false, busy = false, onSelect, onWorkChange, onConfirm }: {
   options: IntentOption[]; selectedId: string; prefix: string; recorded?: boolean; busy?: boolean;
@@ -15,13 +57,13 @@ function IntentChoices({ options, selectedId, prefix, recorded = false, busy = f
 }) {
   return <section className={`selection-assistant-message selection-intent-choice${recorded ? " selection-intent-history" : ""}`} aria-label={recorded ? "已选择的选型环节" : "选择选型环节"}>
     <h2>这次先为哪个 AI 环节选模型？</h2>
-    {!recorded && <p className="selection-hint">工作说明可直接修改，确认后按你的描述选型。</p>}
+    {!recorded && <p className="selection-hint">悬停后点击工作说明即可编辑，确认后按你的描述选型。</p>}
     <div className="selection-intent-options" role="radiogroup" aria-label={recorded ? "选型环节选择记录" : "选择一个 AI 环节"}>{options.map((option) => <div className="selection-intent-option" key={option.id}>
         <input id={`${prefix}-radio-${option.id}`} type="radio" name={prefix} value={option.id} aria-labelledby={`${prefix}-name-${option.id}`} aria-describedby={recorded && option.work ? `${prefix}-work-${option.id}` : undefined} checked={selectedId === option.id} disabled={recorded || busy} onChange={() => onSelect?.(option.id)} />
       <div className="selection-intent-text">
         <label className="selection-intent-title" id={`${prefix}-name-${option.id}`} htmlFor={`${prefix}-radio-${option.id}`}>{option.name}</label>
         {recorded && option.work && <small id={`${prefix}-work-${option.id}`}>{option.work}</small>}
-        {!recorded && <textarea className="selection-intent-work" aria-label={`${option.name}的工作说明`} rows={1} maxLength={4000} value={option.work} disabled={busy} placeholder="描述希望 AI 处理什么、做什么、输出什么" ref={resizeContextField} onChange={(event) => { resizeContextField(event.target); onWorkChange?.(option.id, event.target.value); }} />}
+        {!recorded && <IntentWork option={option} busy={busy} onChange={onWorkChange} />}
       </div>
     </div>)}</div>
     {!recorded && <button className="primary-button" type="button" disabled={busy || !options.some((option) => option.id === selectedId && option.work.trim())} onClick={onConfirm}>{busy ? "确认中…" : "确认选择"}</button>}
@@ -50,6 +92,7 @@ export default function ModelSelection({ hidden, assistant, onAssistantSaved, on
   const transcriptRef = useRef<HTMLDivElement>(null);
   const analysisRef = useRef<HTMLParagraphElement>(null);
   const composerRef = useRef<HTMLTextAreaElement>(null);
+  const pendingViewCard = useRef<RequirementCard | null>(null);
   const [card, setCard] = useState<RequirementCard>();
   const [newConcern, setNewConcern] = useState<{ taskId: string; value: string } | null>(null);
   const [editing, setEditing] = useState(false);
@@ -69,11 +112,14 @@ export default function ModelSelection({ hidden, assistant, onAssistantSaved, on
   const confirmed = Boolean(session?.confirmed) && !editing;
   const activeTask = card?.tasks[0];
   const activeRun = activeTask ? session?.taskRuns?.[activeTask.id] : undefined;
-  const intents = !session?.confirmed && (session?.draft?.tasks.length ?? 0) > 1 ? session!.draft!.tasks : [];
+  const choosingIntent = Boolean(session && needsIntentConfirmation(session));
+  const intents = choosingIntent ? session!.draft!.tasks : [];
   const sharedContext = card?.projectContext?.value ?? "";
   const modelWaitSince = session?.progress?.lastOutputAtMs ?? session?.progress?.modelStartedAtMs;
   const silentSeconds = modelWaitSince ? Math.max(0, Math.floor((now - modelWaitSince) / 1000)) : 0;
   const landing = !card && intents.length === 0 && messages.length === 0 && !session?.running;
+  const conversationTitles = conversations.map((item) => item.id === session?.id ? activeTask?.name || item.title : item.title);
+  const conversationDate = (value: number) => new Intl.DateTimeFormat("zh-CN", { timeZone: "Asia/Shanghai", year: "numeric", month: "2-digit", day: "2-digit", hour: "2-digit", minute: "2-digit", second: "2-digit", hourCycle: "h23" }).format(value);
   const connected = Boolean(assistant?.hasCredential);
   const metrics = session?.metrics;
   const invocation = metrics?.latest ?? session?.invocation;
@@ -88,27 +134,31 @@ export default function ModelSelection({ hidden, assistant, onAssistantSaved, on
 
   function applySession(value: SelectionSession) {
     setNewConcern(null);
+    pendingViewCard.current = null;
     setSession(value);
-    const next = value.confirmed?.card ?? (value.draft?.tasks.length === 1 ? prefillSuggestions(value.draft) : undefined);
+    const next = value.confirmed?.card ?? (!needsIntentConfirmation(value) && value.draft?.tasks.length === 1 ? prefillSuggestions(value.draft) : undefined);
     setIntentWorkEdits({});
-    if (value.draft && value.draft.tasks.length > 1) setIntentId("");
+    if (needsIntentConfirmation(value)) setIntentId("");
     setCard(next);
     setEditing(!value.confirmed);
   }
 
-  function restoreView(view: ConversationView | null | undefined) {
+  function restoreView(view: ConversationView | null | undefined, value: SelectionSession) {
     if (!view) return;
-    setCard(view.card ?? undefined); setDescription(view.description); setMessages(view.messages); setEditing(view.editing);
+    const pending = needsIntentConfirmation(value);
+    pendingViewCard.current = pending ? view.card : null;
+    if (pending && view.card) setIntentWorkEdits(Object.fromEntries(view.card.tasks.filter((task) => task.fields.businessGoal.source === "user").map((task) => [task.id, task.fields.businessGoal.value])));
+    setCard(pending ? undefined : view.card ?? undefined); setDescription(view.description); setMessages(view.messages); setEditing(view.editing);
   }
 
   function currentView(): ConversationView {
-    return { card: card ?? null, description, messages, editing };
+    return { card: card ?? pendingViewCard.current, description, messages, editing };
   }
 
   function applyWorkspace(workspace: SelectionWorkspace) {
     applySession(workspace.session);
     setDescription(""); setMessages(workspace.session.description ? [workspace.session.description] : []);
-    restoreView(workspace.view);
+    restoreView(workspace.view, workspace.session);
     setConversations(workspace.conversations);
     confirmationRef.current = undefined; setNotice(""); setHistoryError("");
   }
@@ -119,7 +169,7 @@ export default function ModelSelection({ hidden, assistant, onAssistantSaved, on
       const [value, index] = await Promise.all([selectionApi.get(), selectionApi.conversations().catch((cause) => { setHistoryError(selectionError(cause)); return null; })]);
       applySession(value);
       if (value.description) setMessages([value.description]);
-      restoreView(index?.view);
+      restoreView(index?.view, value);
       if (Array.isArray(index?.conversations)) setConversations(index.conversations);
     }
     catch (cause) { setError(selectionError(cause)); }
@@ -143,7 +193,7 @@ export default function ModelSelection({ hidden, assistant, onAssistantSaved, on
     if (!session || busy || working) return;
     let disposed = false;
     const timer = setTimeout(() => {
-      void selectionApi.saveConversation(session.id, session.revision, { card: card ?? null, description, messages, editing })
+      void selectionApi.saveConversation(session.id, session.revision, { card: card ?? pendingViewCard.current, description, messages, editing })
         .then((items) => { if (!disposed) { if (Array.isArray(items)) setConversations(items); setHistoryError(""); setSession((current) => current?.storageError ? { ...current, storageError: "" } : current); } })
         .catch((cause) => { if (!disposed) setHistoryError(selectionError(cause)); });
     }, 500);
@@ -159,14 +209,14 @@ export default function ModelSelection({ hidden, assistant, onAssistantSaved, on
     if (analysisRef.current) analysisRef.current.scrollTop = analysisRef.current.scrollHeight;
   }, [session?.progress?.analysisPreview]);
   useEffect(() => {
-    const target = working ? ".selection-pending" : confirmed ? ".selection-confirmed" : !session?.confirmed && session?.intentSelections?.length ? ".selection-intent-history:last-child" : ".selection-card";
+    const target = working ? ".selection-pending" : choosingIntent ? ".selection-intent-choice:not(.selection-intent-history)" : confirmed ? ".selection-confirmed" : !session?.confirmed && session?.intentSelections?.length ? ".selection-intent-history:last-child" : ".selection-card";
     const transcript = transcriptRef.current;
     const content = transcript?.querySelector<HTMLElement>(target);
     if (!hidden && transcript && content) {
       // Scroll only the conversation; scrollIntoView can also move the fixed app shell.
       transcript.scrollTo?.({ top: transcript.scrollTop + content.getBoundingClientRect().top - transcript.getBoundingClientRect().top, behavior: window.matchMedia?.("(prefers-reduced-motion: reduce)").matches ? "auto" : "smooth" });
     }
-  }, [card?.tasks[0]?.id, hidden, working, confirmed, session?.intentSelections?.length]);
+  }, [card?.tasks[0]?.id, intents[0]?.id, hidden, working, confirmed, choosingIntent, session?.intentSelections?.length]);
   useEffect(() => {
     if (!working) return;
     const timer = setInterval(() => setNow(Date.now()), 1000);
@@ -200,7 +250,7 @@ export default function ModelSelection({ hidden, assistant, onAssistantSaved, on
     setSession({ ...session, progress: null });
     setMessages((current) => [...current, message]); setDescription("");
     try {
-      const value = await selectionApi.extract({ sessionId: session.id, revision: session.revision, requestId: crypto.randomUUID(), description: combined });
+      const value = await selectionApi.extract({ sessionId: session.id, revision: session.revision, requestId: crypto.randomUUID(), description: combined, currentMessage: message });
       applySession(value);
     } catch (cause) {
       setError(selectionError(cause)); setDescription(message);
@@ -308,7 +358,12 @@ export default function ModelSelection({ hidden, assistant, onAssistantSaved, on
   async function selectIntent(taskId: string) {
     if (!session || busyRef.current) return;
     busyRef.current = true; setBusy("confirming"); setError("");
-    try { applySession(await selectionApi.selectTask(session.id, session.revision, taskId, intentWorkEdits)); }
+    try {
+      const savedTask = pendingViewCard.current?.tasks.find((task) => task.id === taskId);
+      const value = await selectionApi.selectTask(session.id, session.revision, taskId, intentWorkEdits);
+      applySession(value);
+      if (savedTask && value.draft) setCard(prefillSuggestions({ ...value.draft, tasks: [{ ...savedTask, fields: { ...savedTask.fields, businessGoal: value.draft.tasks[0].fields.businessGoal } }] }));
+    }
     catch (cause) { setError(selectionError(cause)); }
     finally { busyRef.current = false; setBusy(""); }
   }
@@ -339,8 +394,8 @@ export default function ModelSelection({ hidden, assistant, onAssistantSaved, on
     <aside className="selection-sidebar" aria-label="选型对话列表">
       <button className="secondary-button selection-new-conversation" disabled={Boolean(busy) || working || !session} onClick={() => void openConversation()}>＋ 新建选型</button>
       <p className="selection-sidebar-title">选型对话</p>
-      <nav aria-label="历史选型">{conversations.map((item) => <div className={`selection-conversation-row${session?.id === item.id ? " is-active" : ""}`} key={item.id}>
-        <button className="selection-conversation-open" title={item.title} aria-current={session?.id === item.id ? "page" : undefined} disabled={Boolean(busy) || working} onClick={() => void openConversation(item.id)}>{item.pinned && <PinIcon />}<span>{item.id === session?.id ? activeTask?.name || item.title : item.title}</span></button>
+      <nav aria-label="历史选型">{conversations.map((item, index) => <div className={`selection-conversation-row${session?.id === item.id ? " is-active" : ""}`} key={item.id}>
+        <button className="selection-conversation-open" title={item.title} aria-current={session?.id === item.id ? "page" : undefined} disabled={Boolean(busy) || working} onClick={() => void openConversation(item.id)}>{item.pinned && <PinIcon />}<span className="selection-conversation-label"><span className="selection-conversation-name">{conversationTitles[index]}</span><time className="selection-conversation-time" dateTime={new Date(item.updatedAtMs).toISOString()} title={`最后更新：${conversationDate(item.updatedAtMs)}`}>{conversationDate(item.updatedAtMs)}</time></span></button>
         <div className="selection-conversation-actions">
           <button type="button" title={item.pinned ? "取消置顶" : "置顶对话"} aria-label={`${item.pinned ? "取消置顶" : "置顶对话"} ${item.title}`} aria-pressed={Boolean(item.pinned)} disabled={Boolean(busy) || working} onClick={() => void manageConversation(item)}><PinIcon /></button>
           <button type="button" className="selection-conversation-delete" title="删除对话" aria-label={`删除对话 ${item.title}`} disabled={Boolean(busy) || working} onClick={() => void manageConversation(item, true)}><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 7h16M9 7V4h6v3M6 7l1 14h10l1-14M10 11v6m4-6v6" /></svg></button>
@@ -358,8 +413,8 @@ export default function ModelSelection({ hidden, assistant, onAssistantSaved, on
         return <IntentChoices key={index} options={choice.options} selectedId={choice.selectedTaskId} prefix={`intent-history-${index}`} recorded />;
       })}</div>
       {busy === "loading" && <p className="selection-hint" role="status">正在读取需求…</p>}
-      {intents.length > 1 && session?.draft && <IntentChoices options={intentOptions(session.draft).map((option) => ({ ...option, work: intentWorkEdits[option.id] ?? option.work }))} selectedId={intentId} prefix="intent-pending" busy={Boolean(busy)} onSelect={setIntentId} onWorkChange={(id, work) => setIntentWorkEdits((current) => ({ ...current, [id]: work }))} onConfirm={() => void selectIntent(intentId)} />}
-      {card && <div className={`selection-requirements${confirmed ? " is-confirmed" : ""}`} role="group" aria-label="需求确认卡片">
+      {intents.length > 0 && session?.draft && <IntentChoices options={intentOptions(session.draft).map((option) => ({ ...option, work: intentWorkEdits[option.id] ?? option.work }))} selectedId={intentId} prefix="intent-pending" busy={Boolean(busy)} onSelect={setIntentId} onWorkChange={(id, work) => setIntentWorkEdits((current) => ({ ...current, [id]: work }))} onConfirm={() => void selectIntent(intentId)} />}
+      {card && !choosingIntent && <div className={`selection-requirements${confirmed ? " is-confirmed" : ""}`} role="group" aria-label="需求确认卡片">
       <section role="region" aria-label={activeTask?.name}>
       {card.tasks.map((task, taskIndex) => {
         const selected = selectedPriorities(task.fields.priorities.value);

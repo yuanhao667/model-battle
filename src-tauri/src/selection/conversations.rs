@@ -722,6 +722,7 @@ mod tests {
         switch_conversation(&mut current, &mut history, draft.clone(), None).unwrap();
         let mut stale = history.clone();
         let mut stale_current = current.clone();
+        let original_ids: BTreeSet<_> = history.sessions.keys().cloned().collect();
         manage_conversation(
             &mut current,
             &mut history,
@@ -732,6 +733,18 @@ mod tests {
         .unwrap();
         assert!(history.summaries()[0].pinned);
         assert_eq!(history.summaries()[0].id, first);
+        assert_eq!(
+            history.sessions.keys().cloned().collect::<BTreeSet<_>>(),
+            original_ids
+        );
+        assert_eq!(
+            history
+                .summaries()
+                .iter()
+                .filter(|item| item.id == first)
+                .count(),
+            1
+        );
         stale.record(&stale_current, Some(draft.clone()));
         stale.persist().unwrap();
         assert!(stale.sessions[&first].pinned);

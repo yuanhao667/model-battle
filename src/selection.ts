@@ -82,6 +82,7 @@ export type SelectionSession = {
   running: boolean;
   storageError?: string;
   intentSelections?: Array<IntentSelection | string>;
+  intentConfirmationRequired?: boolean | null;
   progress?: { message: string; startedAtMs: number; analysisPreview?: string; receivedChars?: number; modelStartedAtMs?: number | null; lastOutputAtMs?: number | null } | null;
   taskRuns?: Record<string, { research: ResearchResult | null; selectedModel: string | null; fallbackModel?: string | null }>;
   draft: RequirementCard | null;
@@ -89,6 +90,7 @@ export type SelectionSession = {
   invocation: SelectionInvocation | null;
   metrics?: { completedCalls: number; usageCalls: number; totalTokens: number; cacheHitTokens: number; cacheInputTokens: number; latest: SelectionInvocation | null };
 };
+
 
 export type ConversationView = { card: RequirementCard | null; description: string; messages: string[]; editing: boolean };
 export type ConversationSummary = { id: string; title: string; updatedAtMs: number; pinned?: boolean };
@@ -121,6 +123,11 @@ export function emptyTask(): RequirementTask {
     id: crypto.randomUUID(), name: "待确认任务",
     fields: Object.fromEntries(requirementFields.map(([key]) => [key, { value: "", source: "missing", evidence: "" }])) as Record<FieldKey, RequirementField>,
   };
+}
+
+export function needsIntentConfirmation(session: SelectionSession): boolean {
+  if (session.confirmed || !session.draft?.tasks.length) return false;
+  return session.draft.tasks.length > 1 || (session.intentConfirmationRequired ?? !session.intentSelections?.length);
 }
 
 export function intentOptions(card: RequirementCard): IntentOption[] {
@@ -192,7 +199,7 @@ export const selectionApi = {
   get: () => invoke<SelectionSession>("selection_get"),
   reset: (sessionId: string) => invoke<SelectionSession>("selection_reset", { sessionId }),
   saveAssistant: (apiKey: string) => invoke<AssistantSettings>("selection_assistant_set", { input: { apiKey } }),
-  extract: (input: { sessionId: string; revision: number; requestId: string; description: string }) => invoke<SelectionSession>("selection_extract", { input }),
+  extract: (input: { sessionId: string; revision: number; requestId: string; description: string; currentMessage: string }) => invoke<SelectionSession>("selection_extract", { input }),
   selectTask: (sessionId: string, revision: number, taskId: string, workDescriptions: Record<string, string> = {}) => invoke<SelectionSession>("selection_select_task", { sessionId, revision, taskId, workDescriptions }),
   confirm: (input: { sessionId: string; revision: number; requestId: string; card: RequirementCard }) => invoke<SelectionSession>("selection_confirm", { input }),
   research: (sessionId: string, revision: number, taskId: string, retry = false, more = false) => {
