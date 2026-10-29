@@ -8,10 +8,10 @@
 
 [![平台](https://img.shields.io/badge/%E5%B9%B3%E5%8F%B0-Apple_Silicon_Mac-4F8FF7?style=flat-square&labelColor=111827&logo=apple&logoColor=white)](#requirements)
 [![系统](https://img.shields.io/badge/%E7%B3%BB%E7%BB%9F-macOS_14%2B-8B5CF6?style=flat-square&labelColor=111827)](#requirements)
-[![版本](https://img.shields.io/badge/%E7%89%88%E6%9C%AC-v1.1.0-22C55E?style=flat-square&labelColor=111827)](https://github.com/yuanhao667/model-battle/releases/tag/v1.1.0)
-[![安装包](https://img.shields.io/badge/%E5%AE%89%E8%A3%85%E5%8C%85-DMG-F59E0B?style=flat-square&labelColor=111827)](https://github.com/yuanhao667/model-battle/releases/download/v1.1.0/Model.Battle_1.1.0_aarch64.dmg)
+[![版本](https://img.shields.io/badge/%E7%89%88%E6%9C%AC-v1.2.0-22C55E?style=flat-square&labelColor=111827)](https://github.com/yuanhao667/model-battle/releases/tag/v1.2.0)
+[![安装包](https://img.shields.io/badge/%E5%AE%89%E8%A3%85%E5%8C%85-DMG-F59E0B?style=flat-square&labelColor=111827)](https://github.com/yuanhao667/model-battle/releases/download/v1.2.0/Model.Battle_1.2.0_aarch64.dmg)
 
-[![立即下载](https://img.shields.io/badge/%E7%AB%8B%E5%8D%B3%E4%B8%8B%E8%BD%BD-Model_Battle_DMG-F54E00?style=for-the-badge&labelColor=111827&logo=apple&logoColor=white)](https://github.com/yuanhao667/model-battle/releases/download/v1.1.0/Model.Battle_1.1.0_aarch64.dmg)
+[![立即下载](https://img.shields.io/badge/%E7%AB%8B%E5%8D%B3%E4%B8%8B%E8%BD%BD-Model_Battle_DMG-F54E00?style=for-the-badge&labelColor=111827&logo=apple&logoColor=white)](https://github.com/yuanhao667/model-battle/releases/download/v1.2.0/Model.Battle_1.2.0_aarch64.dmg)
 
 [产品简介](#intro) · [核心能力](#features) · [使用前准备](#requirements) · [下载安装](#install) · [开始使用](#usage) · [数据与隐私](#privacy)
 
@@ -29,6 +29,7 @@ Model Battle 是一款面向 Apple Silicon Mac 的本地多模型对比工具。
 <a id="features"></a>
 ## 核心能力
 
+- **模型选型**：整理需求、人工确认、调研推荐与适配评分；选型对话支持本机保存、恢复、置顶和删除。
 - **一次输入，多模型并行**：统一发起任务，结果按模型分栏呈现。
 - **流式输出**：文本模型边生成边显示（打字机效果），不用盯着转圈等完整结果。
 - **覆盖四类生成任务**：支持文本、图片、音频与视频模型；音频包含文本转音频和音频转文本。
@@ -64,7 +65,7 @@ Model Battle 是一款面向 Apple Silicon Mac 的本地多模型对比工具。
 <a id="install"></a>
 ## 下载安装
 
-1. 下载最新的 [Model Battle v1.1.0 DMG 安装包](https://github.com/yuanhao667/model-battle/releases/download/v1.1.0/Model.Battle_1.1.0_aarch64.dmg)。
+1. 下载最新的 [Model Battle v1.2.0 DMG 安装包](https://github.com/yuanhao667/model-battle/releases/download/v1.2.0/Model.Battle_1.2.0_aarch64.dmg)。
 2. 打开 DMG，将 `Model Battle.app` 拖入“应用程序”文件夹。
 3. 从“应用程序”中打开 Model Battle。
 
@@ -86,14 +87,17 @@ Model Battle 是一款面向 Apple Silicon Mac 的本地多模型对比工具。
 3. 返回“模型 Battle”，选择任务类型并输入提示词；图片、音频和视频任务可继续添加对应素材或参数。
 4. 点击运行全部模型，文本结果会边生成边显示，同一界面比较各模型的输出、耗时、出字速度与 Token 用量；把鼠标停在结果卡片上可以看更细的指标，卡片右下角可直接复制回答。
 
+需要模型选型时，在“模型配置”填写 DeepSeek 官网 API Key，再进入“模型选型”描述需求、确认需求卡并查看推荐。
+
 同一轮任务只会运行当前类型下已经启用的模型。不同任务类型的模型可以分别配置和启用。
 
 <a id="privacy"></a>
 ## 数据与隐私
 
 - API Key 保存在本机 `~/Library/Application Support/io.github.yuanhao667.modelbattle/credentials.json`，文件权限仅当前用户可读（600），未额外加密；不会写入项目文件或 Git。
+- 模型选型的 DeepSeek 官网 API Key 单独保存在本机 `selection-driver.json`，与 Battle 的服务商 Key 分开。选型对话与报告保存在本机，可主动删除。
 - 非敏感模型配置保存在本机，并保留本地备份用于异常恢复。
-- 应用不保存运行历史；完全退出后，上一轮提示词和结果会被清空。
+- 模型 Battle 不保存运行历史；完全退出后，上一轮提示词和结果会被清空。
 - 模型生成的图片、音频、视频只写入应用缓存目录，仅用于当次显示；应用启动时和每次运行前都会自动清理，不会长期占用磁盘。
 - 提示词和所选素材会发送给你主动配置并调用的模型服务商，请遵循相应服务商的隐私政策。
 
