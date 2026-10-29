@@ -17,11 +17,12 @@ function IntentChoices({ options, selectedId, prefix, recorded = false, busy = f
     <h2>这次先为哪个 AI 环节选模型？</h2>
     {!recorded && <p className="selection-hint">工作说明可直接修改，确认后按你的描述选型。</p>}
     <div className="selection-intent-options" role="radiogroup" aria-label={recorded ? "选型环节选择记录" : "选择一个 AI 环节"}>{options.map((option) => <div className="selection-intent-option" key={option.id}>
-      <label>
-        <input type="radio" name={prefix} value={option.id} aria-labelledby={`${prefix}-name-${option.id}`} aria-describedby={recorded && option.work ? `${prefix}-work-${option.id}` : undefined} checked={selectedId === option.id} disabled={recorded || busy} onChange={() => onSelect?.(option.id)} />
-        <span className="selection-intent-text"><span id={`${prefix}-name-${option.id}`}>{option.name}</span>{recorded && option.work && <small id={`${prefix}-work-${option.id}`}>{option.work}</small>}</span>
-      </label>
-      {!recorded && <textarea className="selection-intent-work" aria-label={`${option.name}的工作说明`} rows={1} maxLength={4000} value={option.work} disabled={busy} placeholder="描述希望 AI 处理什么、做什么、输出什么" ref={resizeContextField} onChange={(event) => { resizeContextField(event.target); onWorkChange?.(option.id, event.target.value); }} />}
+        <input id={`${prefix}-radio-${option.id}`} type="radio" name={prefix} value={option.id} aria-labelledby={`${prefix}-name-${option.id}`} aria-describedby={recorded && option.work ? `${prefix}-work-${option.id}` : undefined} checked={selectedId === option.id} disabled={recorded || busy} onChange={() => onSelect?.(option.id)} />
+      <div className="selection-intent-text">
+        <label className="selection-intent-title" id={`${prefix}-name-${option.id}`} htmlFor={`${prefix}-radio-${option.id}`}>{option.name}</label>
+        {recorded && option.work && <small id={`${prefix}-work-${option.id}`}>{option.work}</small>}
+        {!recorded && <textarea className="selection-intent-work" aria-label={`${option.name}的工作说明`} rows={1} maxLength={4000} value={option.work} disabled={busy} placeholder="描述希望 AI 处理什么、做什么、输出什么" ref={resizeContextField} onChange={(event) => { resizeContextField(event.target); onWorkChange?.(option.id, event.target.value); }} />}
+      </div>
     </div>)}</div>
     {!recorded && <button className="primary-button" type="button" disabled={busy || !options.some((option) => option.id === selectedId && option.work.trim())} onClick={onConfirm}>{busy ? "确认中…" : "确认选择"}</button>}
   </section>;
@@ -159,7 +160,12 @@ export default function ModelSelection({ hidden, assistant, onAssistantSaved, on
   }, [session?.progress?.analysisPreview]);
   useEffect(() => {
     const target = working ? ".selection-pending" : confirmed ? ".selection-confirmed" : !session?.confirmed && session?.intentSelections?.length ? ".selection-intent-history:last-child" : ".selection-card";
-    if (!hidden) transcriptRef.current?.querySelector(target)?.scrollIntoView?.({ block: "start", behavior: window.matchMedia?.("(prefers-reduced-motion: reduce)").matches ? "auto" : "smooth" });
+    const transcript = transcriptRef.current;
+    const content = transcript?.querySelector<HTMLElement>(target);
+    if (!hidden && transcript && content) {
+      // Scroll only the conversation; scrollIntoView can also move the fixed app shell.
+      transcript.scrollTo?.({ top: transcript.scrollTop + content.getBoundingClientRect().top - transcript.getBoundingClientRect().top, behavior: window.matchMedia?.("(prefers-reduced-motion: reduce)").matches ? "auto" : "smooth" });
+    }
   }, [card?.tasks[0]?.id, hidden, working, confirmed, session?.intentSelections?.length]);
   useEffect(() => {
     if (!working) return;

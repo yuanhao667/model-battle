@@ -970,9 +970,11 @@ describe("model selection", () => {
     draft.tasks[0].fields.taskDifficulty = { value: "易", source: "user", evidence: "" };
     draft.tasks[0].userConcerns = ["缺项追问"];
     invoke.mockResolvedValue({ ...initial(), running: status === "running", confirmed: { card: draft, revision: 1, confirmedAtMs: 1 }, taskRuns: { [draft.tasks[0].id]: { selectedModel: null, research: { status, revision: 1, sources: [], error: "", report: status === "complete" ? { findings: [], questions: [], groups: [{ taskId: draft.tasks[0].id, candidates: [{ model: "recommended-model", reason: "本次推荐", role: "main", evidence: [], test: "", gaps: [] }], gaps: [] }] } : null } } } });
-    const originalScroll = HTMLElement.prototype.scrollIntoView;
+    const originalScroll = HTMLElement.prototype.scrollTo;
+    const originalScrollIntoView = HTMLElement.prototype.scrollIntoView;
     const scrolled: HTMLElement[] = [];
-    HTMLElement.prototype.scrollIntoView = function () { scrolled.push(this); };
+    HTMLElement.prototype.scrollTo = function () { scrolled.push(this); };
+    HTMLElement.prototype.scrollIntoView = function () { throw new Error("不能滚动整个页面，只能滚动对话区域"); };
     try {
       mount();
       const requirements = await screen.findByRole("group", { name: "需求确认卡片" });
@@ -987,16 +989,16 @@ describe("model selection", () => {
       if (status === "running") {
         const pending = screen.getByRole("region", { name: "处理进展" });
         expect(requirements.compareDocumentPosition(pending) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
-        expect(scrolled[scrolled.length - 1]).toHaveClass("selection-pending");
+        expect(scrolled[scrolled.length - 1]).toBe(screen.getByRole("log", { name: "选型对话" }));
       } else {
         const result = screen.getByRole("region", { name: "选型调研" });
         expect(requirements.compareDocumentPosition(result) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
-        expect(scrolled[scrolled.length - 1]).toHaveClass("selection-confirmed");
+        expect(scrolled[scrolled.length - 1]).toBe(screen.getByRole("log", { name: "选型对话" }));
         await user.click(screen.getByRole("button", { name: "修改需求" }));
         expect(within(requirements).getByRole("textbox", { name: "任务 1：输入" })).toBeEnabled();
-        expect(scrolled[scrolled.length - 1]).toHaveClass("selection-card");
+        expect(scrolled[scrolled.length - 1]).toBe(screen.getByRole("log", { name: "选型对话" }));
       }
-    } finally { HTMLElement.prototype.scrollIntoView = originalScroll; }
+    } finally { HTMLElement.prototype.scrollTo = originalScroll; HTMLElement.prototype.scrollIntoView = originalScrollIntoView; }
   });
 
   it("creates a separate conversation, preserves the old report and draft, and restores them from the sidebar", async () => {
